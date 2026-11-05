@@ -36,10 +36,12 @@ from backend.agent import (  # noqa: E402
 )
 from backend.commands import BUSY_REFUSED, execute_command  # noqa: E402
 from backend.context import (  # noqa: E402
+    SessionState,
     bind_response,
     create_session,
     latest_response_id,
     reserve_response_id,
+    transition_state,
 )
 
 
@@ -255,6 +257,114 @@ class TestApplyAndRerun(unittest.TestCase):
         state = _session()
         with self.assertRaises(ValueError):
             _run(agent_loop(None, _MCP(), state, _Log(), "sys", None))
+
+
+class _PlanMCP:
+    """One write-capable MCP tool. In plan mode it is only ever queued."""
+    all_tools = [{"server": "files", "name": "write_file", "full_name": "files/write_file",
+                  "description": "write a file",
+                  "inputSchema": {"type": "object", "properties": {"path": {"type": "string"},
+                                                                    "content": {"type": "string"}}}}]
+    servers = {}
+
+    def get_tools_prompt(self, **kwargs):
+        return ""
+
+
+def _write_call_text(path):
+    return _reply('{"tool": "files/write_file", "arguments": {"path": "%s", "content": "x"}}' % path)
+
+
+def _write_call_native(path):
+    call = {"id": "call_" + path.strip("/").replace("/", "_"), "type": "function",
+            "function": {"name": "files__write_file",
+                         "arguments": '{"path": "%s", "content": "x"}' % path}}
+    return _reply("", tool_calls=[call])
+
+
+class TestPlanMode(unittest.TestCase):
+    """The case regenerate is mostly for: a dumb plan."""
+
+    def _plan_session(self, native=False):
+        state = _session(tools=True)
+        state.model_supports_tools = native
+        transition_state(state, SessionState.PLAN_REVIEW)
+        return state
+
+    def _run_plan_turn(self, native):
+        state, log = self._plan_session(native), _Log()
+        msgs = [{"role": "system", "content": "sys"}]
+        call = _write_call_native if native else _write_call_text
+        fake = _fake_chat([call("/tmp/dumb"), _reply("Plan: write /tmp/dumb"),
+                           call("/tmp/good"), _reply("Plan: write /tmp/good")])
+        with mock.patch.object(agent, "chat", fake):
+            _run(agent_loop("make a plan", _PlanMCP(), state, log, "sys", msgs))
+            self.assertEqual([s["args"]["path"] for s in state.pending_plan], ["/tmp/dumb"])
+            plan, why = plan_regenerate(msgs, state)
+            self.assertEqual(why, "")
+            self.assertTrue(plan.whole_turn)
+            self.assertEqual(plan.plan_steps, 1)
+            self.assertEqual(plan.tool_calls_ran, 0)      # queued, never ran
+            self.assertFalse(plan.needs_confirm)          # instant, like any AI tool
+            apply_regenerate(msgs, state, plan, log)
+            self.assertEqual(state.pending_plan, [])
+            self.assertEqual(msgs[-1]["content"], "make a plan")   # back to your message
+            _run(agent_loop(None, _PlanMCP(), state, log, "sys", msgs, new_task=False))
+        # exactly one plan queued — the new one
+        self.assertEqual([s["args"]["path"] for s in state.pending_plan], ["/tmp/good"])
+        self.assertTrue(state.plan_mode)
+        self.assertEqual(msgs[-1]["content"], "Plan: write /tmp/good")
+
+    def test_text_profile_plan_redo_replaces_queue(self):
+        self._run_plan_turn(native=False)
+
+    def test_native_profile_plan_redo_replaces_queue(self):
+        self._run_plan_turn(native=True)
+
+    def test_explicit_number_redoes_only_that_reply(self):
+        state, log = self._plan_session(), _Log()
+        msgs = [{"role": "system", "content": "sys"}]
+        with mock.patch.object(agent, "chat", _fake_chat([_write_call_text("/tmp/a"),
+                                                          _reply("Plan: write /tmp/a")])):
+            _run(agent_loop("plan it", _PlanMCP(), state, log, "sys", msgs))
+        rid = latest_response_id(state)
+        plan, _ = plan_regenerate(msgs, state, rid)
+        self.assertFalse(plan.whole_turn)
+        self.assertEqual(plan.plan_steps, 0)              # the step belongs to the earlier reply
+        apply_regenerate(msgs, state, plan, log)
+        self.assertEqual(len(state.pending_plan), 1)
+
+    def test_bare_regen_outside_plan_mode_is_latest_reply_only(self):
+        state = _session()
+        msgs = _conversation(state)
+        plan, _ = plan_regenerate(msgs, state)
+        self.assertFalse(plan.whole_turn)
+        self.assertEqual(plan.index, len(msgs) - 1)
+
+    def test_paused_out_of_plan_mode_counts_as_plan(self):
+        state, log = self._plan_session(), _Log()
+        msgs = [{"role": "system", "content": "sys"}]
+        with mock.patch.object(agent, "chat", _fake_chat([_write_call_text("/tmp/a"),
+                                                          _reply("Plan: write /tmp/a")])):
+            _run(agent_loop("plan it", _PlanMCP(), state, log, "sys", msgs))
+        transition_state(state, SessionState.PAUSED)
+        plan, _ = plan_regenerate(msgs, state)
+        self.assertTrue(plan.whole_turn)
+
+
+class TestSideEffectCounting(unittest.TestCase):
+    def test_reads_and_denials_dont_count(self):
+        from backend.agent import _count_side_effect_calls
+        span = [
+            {"role": "tool", "name": "files/read_file", "content": "data"},
+            {"role": "tool", "name": "shell/execute_command", "content": "[DENIED] no"},
+            {"role": "tool", "name": "files/write_file", "content": "[PLAN MODE] Queued for review — NOT executed yet."},
+            {"role": "tool", "name": "shell/execute_command", "content": "ok"},
+            {"role": "user", "content": "[TOOL RESULTS]\n\n=== files/read_file (success) ===\nx\n\n"
+                                        "=== shell/execute_command (FAILED) ===\nNot executed — paused\n\n"
+                                        "=== shell/execute_command (success) ===\ndone\n[/TOOL RESULTS]"},
+        ]
+        self.assertEqual(_count_side_effect_calls(span), 2)
 
 
 class TestCommand(unittest.TestCase):

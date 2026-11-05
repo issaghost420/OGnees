@@ -91,11 +91,14 @@ The keyboard stays live while OGneey works:
 - **`/regenerate [N]`** (`/regen`, `/retry`, `/redo`) redoes a reply. Every
   OGneey reply is printed with its number (`#3 · ↻ /regen 3`), so any reply
   can be redone, not just the latest. With no number it redoes the latest
-  reply instantly. Redoing an earlier one rewinds the conversation to just
-  before it — the replies and messages after it leave the model's context —
-  so it asks first, and everything dropped stays in the session log. Tool
-  calls that already ran are not undone. At `OGNEE_TEMPERATURE=0` a redo will
-  usually come out the same.
+  reply instantly. In plan mode it redoes the whole latest plan turn (the
+  lookups plus the summary) and discards the steps that turn queued, so
+  `/execute` never runs the old plan next to the new one. Redoing an earlier
+  reply rewinds the conversation to just before it — the replies and messages
+  after it leave the model's context — so it asks first if that drops your
+  messages or skips back over tool calls that really ran (those aren't
+  undone). Everything dropped stays in the session log. At
+  `OGNEE_TEMPERATURE=0` a redo will usually come out the same.
 
 `/help` lists every command (generated from the command registry);
 `/help <command>` shows details and aliases.

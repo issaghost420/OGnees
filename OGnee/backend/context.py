@@ -366,6 +366,9 @@ class Session:
     number_responses: bool = False
     response_counter: int = 0
     response_marks: Dict[int, Dict[str, Any]] = field(default_factory=dict, repr=False)
+    # (queued plan step, assistant message that proposed it) — lets /regenerate
+    # drop the steps of a plan it redoes instead of executing both plans.
+    plan_step_owners: List[Any] = field(default_factory=list, repr=False)
 
     @property
     def tokens_remaining(self) -> int:

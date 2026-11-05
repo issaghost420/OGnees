@@ -1359,6 +1359,17 @@ def _force_pause_exit(messages: list, state: Session, logger: SessionLogger,
     return True
 
 
+def _own_plan_steps(state: Session, steps: list, owner: Dict[str, Any]):
+    """Remember which assistant message queued these plan steps, so
+    /regenerate can drop them with the reply that proposed them."""
+    if not steps:
+        return
+    pending = {id(s) for s in getattr(state, "pending_plan", []) or []}
+    owners = [(s, o) for s, o in getattr(state, "plan_step_owners", []) if id(s) in pending]
+    owners.extend((s, owner) for s in steps)
+    state.plan_step_owners = owners
+
+
 def _show_reasoning(state: Session, logger: SessionLogger, reasoning: str):
     if not reasoning:
         return
@@ -1554,6 +1565,7 @@ async def agent_loop(
         inflight = None
         text = ""
         shown_rid = None   # number printed under this reply (bound once it's in history)
+        queued_steps = []  # plan-mode steps this reply queued (dropped if it's regenerated)
         try:
             # Call LLM — with native tool schemas when the model profile
             # supports them, otherwise rely on the profiled text format.
@@ -1779,6 +1791,7 @@ async def agent_loop(
                         from .tools import queue_tool_call
                         for tc in write_calls:
                             queue_tool_call(state, tc["server"], tc["tool"], tc["args"])
+                            queued_steps.append(state.pending_plan[-1])
                             queued_write_calls.append(tc)
                         print_system(f"  📋 Queued {len(write_calls)} tool(s) for review. Use /execute to run, /clear to discard.")
 
@@ -1857,6 +1870,7 @@ async def agent_loop(
                     }
                     messages.append(assistant_msg)
                     bind_response(state, shown_rid, assistant_msg)
+                    _own_plan_steps(state, queued_steps, assistant_msg)
                     for tr_msg in format_tool_results_for_llm(tool_results, tool_calls):
                         if len(tr_msg.get("content", "")) > MAX_TOOL_RESULT_CHARS:
                             tr_msg["content"] = (
@@ -1895,6 +1909,7 @@ async def agent_loop(
                     assistant_msg = {"role": "assistant", "content": text or "Using tools..."}
                     messages.append(assistant_msg)
                     bind_response(state, shown_rid, assistant_msg)
+                    _own_plan_steps(state, queued_steps, assistant_msg)
                     messages.append({
                         "role": "user",
                         "content": (
@@ -2025,15 +2040,18 @@ async def execute_plan_queue(
 
 @dataclass
 class RegenPlan:
-    """What /regenerate N would do to the conversation (nothing is changed
+    """What /regenerate would do to the conversation (nothing is changed
     until apply_regenerate)."""
-    response_id: int
-    index: int                    # position of reply #N in messages
-    old_text: str                 # what reply #N said (kept in the session log)
-    dropped_messages: int         # messages removed, reply #N included
-    later_replies: List[int]      # reply numbers after #N that go away too
-    operator_turns: int           # operator messages after #N that go away
-    tool_calls_ran: int           # tool calls in the dropped span (already executed)
+    response_id: int              # the reply being redone (the newest one in a whole-turn redo)
+    index: int                    # rewind point: messages[index:] are dropped
+    old_text: str                 # what the redone reply(s) said (kept in the session log)
+    dropped_messages: int         # messages removed
+    later_replies: List[int]      # other numbered replies that go away too
+    operator_turns: int           # operator messages in the dropped span
+    tool_calls_ran: int           # side-effecting tool calls in the span that actually ran
+    plan_steps: int = 0           # queued plan-mode steps (never run) that get discarded
+    whole_turn: bool = False      # plan mode: redo every reply since your last message
+    first_reply: Optional[int] = None   # first numbered reply in a whole-turn redo
 
     @property
     def is_latest(self) -> bool:
@@ -2041,9 +2059,18 @@ class RegenPlan:
 
     @property
     def needs_confirm(self) -> bool:
-        """Redoing the newest plain reply is instant; anything that throws
-        away later turns, or skips over tool calls that already ran, asks."""
-        return bool(self.later_replies or self.operator_turns or self.tool_calls_ran)
+        """Instant unless it throws away messages you sent, or skips back
+        over tool calls that really ran (those aren't undone)."""
+        return bool(self.operator_turns or self.tool_calls_ran)
+
+    @property
+    def label(self) -> str:
+        if self.whole_turn:
+            first = self.first_reply
+            if first is not None and first != self.response_id:
+                return f"replies #{first}–#{self.response_id} (the whole plan turn)"
+            return f"reply #{self.response_id} (the whole plan turn)"
+        return f"reply #{self.response_id}"
 
 
 def _is_tool_results_turn(msg: Dict[str, Any]) -> bool:
@@ -2064,11 +2091,70 @@ def _is_operator_turn(msg: Dict[str, Any]) -> bool:
                 or (content.startswith("[") and "earlier messages trimmed" in content))
 
 
+# Tool results that mean "this call did not run" (plan-mode queue, gate
+# denials, batch halts) — those need no "can't undo it" warning.
+_NOT_RUN_PREFIXES = ("[PLAN MODE] Queued", "[DENIED]", "Not executed", "Denied by",
+                     "Blocked by", "skipped:")
+_TEXT_RESULT_RE = re.compile(r"^=== (\S+) \((?:success|FAILED)\) ===\n", re.M)
+
+
+def _ran_with_side_effects(tool_key: str, body: str) -> bool:
+    tool = (tool_key or "").replace(NATIVE_NAME_SEP, "/").split("/")[-1]
+    if tool in READ_ONLY_TOOLS:
+        return False
+    return not (body or "").lstrip().startswith(_NOT_RUN_PREFIXES)
+
+
+def _count_side_effect_calls(dropped: List[Dict[str, Any]]) -> int:
+    """Tool calls in the span that ran and could have changed something."""
+    count = 0
+    answered = {m.get("tool_call_id") for m in dropped if m.get("role") == "tool"}
+    for m in dropped:
+        if m.get("role") == "tool":
+            body = m.get("content") if isinstance(m.get("content"), str) else ""
+            if _ran_with_side_effects(m.get("name", ""), body):
+                count += 1
+        elif m.get("role") == "assistant" and m.get("tool_calls"):
+            # calls with no result in the span (e.g. force-paused) may have partly run
+            for tc in m["tool_calls"]:
+                if tc.get("id") not in answered:
+                    name = (tc.get("function") or {}).get("name", "")
+                    if _ran_with_side_effects(name, ""):
+                        count += 1
+        elif _is_tool_results_turn(m):
+            content = m["content"]
+            heads = list(_TEXT_RESULT_RE.finditer(content))
+            for i, h in enumerate(heads):
+                stop = heads[i + 1].start() if i + 1 < len(heads) else len(content)
+                if _ran_with_side_effects(h.group(1), content[h.end():stop]):
+                    count += 1
+    return count
+
+
+def _queued_steps_in(state: Session, dropped: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Plan-mode steps still queued that were proposed by a dropped reply."""
+    dropped_ids = {id(m) for m in dropped}
+    pending_ids = {id(s) for s in getattr(state, "pending_plan", []) or []}
+    return [step for step, owner in getattr(state, "plan_step_owners", [])
+            if id(owner) in dropped_ids and id(step) in pending_ids]
+
+
+def _in_plan_mode(state: Session) -> bool:
+    """Plan mode, or paused out of it."""
+    if getattr(state, "plan_mode", False):
+        return True
+    return (state.mode is SessionState.PAUSED
+            and getattr(state, "previous_mode", None) is SessionState.PLAN_REVIEW)
+
+
 def plan_regenerate(messages: list, state: Session,
                     response_id: Optional[int] = None) -> Tuple[Optional[RegenPlan], str]:
     """Work out how to redo reply #response_id (default: the latest one).
 
-    Returns (plan, "") or (None, reason it can't be done).
+    In plan mode a bare /regenerate redoes the whole latest turn — every
+    reply since your last message, read-only lookups included — and drops
+    the steps it queued, because a plan is usually spread over a tool-call
+    reply plus a summary. Returns (plan, "") or (None, reason).
     """
     marks = getattr(state, "response_marks", {}) or {}
     if not marks:
@@ -2083,30 +2169,48 @@ def plan_regenerate(messages: list, state: Session,
     if index is None or index == 0:
         return None, (f"Reply #{rid} has been trimmed out of OGneey's context window, "
                       "so it can't be regenerated.")
+
+    whole_turn = response_id is None and _in_plan_mode(state)
+    if whole_turn:
+        j = index - 1
+        while j > 0 and not _is_operator_turn(messages[j]):
+            j -= 1
+        if j > 0:
+            index = j + 1
+
     dropped = messages[index:]
-    tool_calls_ran = 0
-    for m in dropped:
-        if m.get("role") == "assistant" and m.get("tool_calls"):
-            tool_calls_ran += len(m["tool_calls"])
-        elif _is_tool_results_turn(m):
-            tool_calls_ran += max(1, m["content"].count("\n=== "))
-    later = sorted(k for k, m in marks.items() if k > rid)
+    dropped_ids = {id(m) for m in dropped}
+    in_span = sorted(k for k, m in marks.items() if id(m) in dropped_ids)
+    old_text = "\n\n".join((marks[k].get("content") or "") for k in in_span if k <= rid).strip()
     return RegenPlan(
         response_id=rid,
         index=index,
-        old_text=target.get("content") or "",
+        old_text=old_text or (target.get("content") or ""),
         dropped_messages=len(dropped),
-        later_replies=later,
-        operator_turns=sum(1 for m in dropped[1:] if _is_operator_turn(m)),
-        tool_calls_ran=tool_calls_ran,
+        later_replies=[k for k in in_span if k > rid],
+        operator_turns=sum(1 for m in dropped if m is not target and _is_operator_turn(m)),
+        tool_calls_ran=_count_side_effect_calls(dropped),
+        plan_steps=len(_queued_steps_in(state, dropped)),
+        whole_turn=whole_turn,
+        first_reply=in_span[0] if in_span else rid,
     ), ""
 
 
 def apply_regenerate(messages: list, state: Session, plan: RegenPlan,
                      logger: Optional[SessionLogger] = None) -> None:
-    """Rewind the conversation to just before reply #N."""
+    """Rewind the conversation to the plan's rewind point."""
+    dropped = messages[plan.index:]
+    dropped_ids = {id(m) for m in dropped}
+    # Steps the dropped replies queued would otherwise ride along into the
+    # next /execute next to the new plan.
+    stale = {id(s) for s in _queued_steps_in(state, dropped)}
+    if stale:
+        state.pending_plan[:] = [s for s in state.pending_plan if id(s) not in stale]
+    state.plan_step_owners = [(s, o) for s, o in getattr(state, "plan_step_owners", [])
+                              if id(o) not in dropped_ids]
     del messages[plan.index:]
-    for k in [k for k in state.response_marks if k >= plan.response_id]:
+    for k in [k for k, m in state.response_marks.items()
+              if id(m) in dropped_ids or k >= plan.response_id]:
         del state.response_marks[k]
     # Re-estimate context use for the shorter history (the next API reply
     # replaces this with the server's real count).
@@ -2114,15 +2218,17 @@ def apply_regenerate(messages: list, state: Session, plan: RegenPlan,
     if logger is not None:
         logger.log_event("regenerate", {
             "response": plan.response_id,
+            "whole_turn": plan.whole_turn,
             "replaced_text": redact_secrets(plan.old_text),
             "dropped_messages": plan.dropped_messages,
             "dropped_replies": plan.later_replies,
+            "plan_steps_discarded": plan.plan_steps,
             "tool_calls_not_undone": plan.tool_calls_ran,
         })
 
 
 def describe_regen_plan(plan: RegenPlan) -> str:
-    lines = [f"Rewinds the conversation to just before reply #{plan.response_id}."]
+    lines = [f"Rewinds the conversation to just before {plan.label}."]
     later = plan.later_replies
     if len(later) == 1:
         lines.append(f"Reply #{later[0]} after it leaves OGneey's context.")
@@ -2130,9 +2236,11 @@ def describe_regen_plan(plan: RegenPlan) -> str:
         lines.append(f"The {len(later)} replies after it (#{later[0]}–#{later[-1]}) leave OGneey's context.")
     if plan.operator_turns:
         lines.append(f"{plan.operator_turns} message(s) you sent after it leave OGneey's context.")
+    if plan.plan_steps:
+        lines.append(f"{plan.plan_steps} queued plan step(s) from it are discarded (they never ran).")
     if plan.tool_calls_ran:
-        lines.append(f"{plan.tool_calls_ran} tool call(s) were made in that span — rewinding "
-                     "does NOT undo any that ran (written files stay written).")
+        lines.append(f"{plan.tool_calls_ran} tool call(s) in that span already ran — rewinding "
+                     "does NOT undo them (written files stay written).")
     lines.append("Everything dropped stays in the session log.")
     return "\n│ ".join(lines)
 
@@ -2365,22 +2473,32 @@ def interactive_session(mcp: MCPManager, state: Session, logger: SessionLogger, 
             print_warning(f"  {why}")
             return
         if plan.needs_confirm:
-            answer = prompt_approval(f"/regenerate #{plan.response_id}", describe_regen_plan(plan))
+            answer = prompt_approval(f"/regenerate {plan.label}", describe_regen_plan(plan))
             if answer != "y":
                 print_system("  Nothing changed.")
                 return
-        apply_regenerate(messages, state, plan, logger)
+        # Decide where an unpause lands BEFORE dropping queued plan steps:
+        # resume_target() only returns to plan mode while steps are queued,
+        # and redoing a plan must never fall through to normal (executing) mode.
+        unpause_to = None
         if state.mode is SessionState.PAUSED:
+            unpause_to = (SessionState.PLAN_REVIEW
+                          if getattr(state, "previous_mode", None) is SessionState.PLAN_REVIEW
+                          else resume_target(state))
+        apply_regenerate(messages, state, plan, logger)
+        if unpause_to is not None:
             # the redo replaces whatever was paused
-            transition_state(state, resume_target(state))
+            transition_state(state, unpause_to)
             state.resume_pending = False
         if DEFAULT_TEMPERATURE <= 0:
             print_dim("  (temperature is 0 — the redo will probably come out the same; "
                       "set OGNEE_TEMPERATURE above 0 for variety)")
-        print_system(f"  ↻ Regenerating reply #{plan.response_id}…")
-        # Rewinding past later turns starts a fresh task (task-scoped approval
-        # exceptions reset); redoing the newest reply keeps them.
-        start_task(None, new_task=not plan.is_latest)
+        if plan.plan_steps:
+            print_dim(f"  📋 discarded {plan.plan_steps} queued plan step(s) from the old version")
+        print_system(f"  ↻ Regenerating {plan.label}…")
+        # Rewinding past your own messages starts a fresh task (task-scoped
+        # approval exceptions reset); redoing within the current turn keeps them.
+        start_task(None, new_task=plan.operator_turns > 0)
 
     def run_command_line(line: str) -> str:
         """Execute a slash command on the main thread; returns its canonical name."""

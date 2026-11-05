@@ -69,6 +69,12 @@ STATE_FILE = OGNEEYS_DIR / "state.md"          # The persistent brain
 CONTINUATION_DIR = OGNEEYS_DIR / "continuations"
 SCRATCH_DIR = OGNEEYS_DIR / "scratch"
 TOOL_LOG = OGNEEYS_DIR / "tool-calls.log"
+INPUT_HISTORY_FILE = OGNEEYS_DIR / "input_history"   # up-arrow history for the prompt
+
+# Shell policy (Zed-style allow / confirm / deny for execute_command).
+# Looked up in this order: $OGNEE_SHELL_POLICY, backend/shell-policy.json,
+# OGnee/shell-policy.json; built-in defaults if none exist. Hot-reloaded.
+SHELL_POLICY_FILE = BACKEND_DIR / "shell-policy.json"
 
 # MCP config
 MCP_CONFIG = BACKEND_DIR / "mcp.json"

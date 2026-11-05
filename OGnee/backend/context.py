@@ -6,8 +6,10 @@ The brain's awareness of its own limits. Tracks token usage,
 injects state into prompts, triggers hard stops when context runs low.
 """
 
+import json
 import os
 import re
+import threading
 import time
 from datetime import datetime
 from enum import Enum, auto
@@ -19,7 +21,7 @@ try:
 except ImportError:  # pragma: no cover - depends on environment
     tiktoken = None
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any, Set
+from typing import Optional, List, Dict, Any, Set, Callable
 from pathlib import Path
 
 from .config import (
@@ -119,10 +121,11 @@ def count_message_tokens(
         elif isinstance(content, list):
             # Multi-part content (text + tool calls etc)
             for part in content:
-                if isinstance(part, dict):
-                    total += count_tokens(str(part))
-                else:
-                    total += count_tokens(str(part))
+                total += count_tokens(str(part))
+        # Native tool calls carry their arguments outside "content" (a
+        # write_file call can be most of the message); count them too.
+        if msg.get("tool_calls"):
+            total += count_tokens(json.dumps(msg["tool_calls"], default=str))
     return total
 
 
@@ -216,6 +219,58 @@ def drain_queued_messages(state: "Session") -> List[str]:
     return queued
 
 
+def reserve_response_id(state: "Session") -> Optional[int]:
+    """Number for the reply about to be printed (None outside the REPL)."""
+    if not getattr(state, "number_responses", False):
+        return None
+    state.response_counter += 1
+    return state.response_counter
+
+
+def bind_response(state: "Session", response_id: Optional[int], message: Dict[str, Any]) -> None:
+    """Tie a printed reply number to its assistant message in the history."""
+    if response_id is not None:
+        state.response_marks[response_id] = message
+
+
+def latest_response_id(state: "Session") -> Optional[int]:
+    marks = getattr(state, "response_marks", None) or {}
+    return max(marks) if marks else None
+
+
+def post_inbox(state: "Session", text: str) -> int:
+    """Queue a message typed while the agent is running (thread-safe)."""
+    with state.inbox_lock:
+        state.inbox.append(text)
+        return len(state.inbox)
+
+
+def drain_inbox(state: "Session") -> List[str]:
+    """Pop everything typed mid-turn (thread-safe)."""
+    with state.inbox_lock:
+        items = list(state.inbox)
+        state.inbox.clear()
+        return items
+
+
+def request_force_pause(state: "Session") -> None:
+    """Stop the running turn NOW (used by /pf and Ctrl-C mid-turn)."""
+    state.abort_event.set()
+    for hook in list(state.force_pause_hooks):
+        try:
+            hook()
+        except Exception:
+            pass
+
+
+def tier_level_of(state: "Session") -> int:
+    from .config import TIERS
+    for level, tier in TIERS.items():
+        if tier.name == state.trust_tier:
+            return level
+    return 0
+
+
 
 @dataclass
 class Session:
@@ -269,8 +324,52 @@ class Session:
     custom_prompt: str = ""
     disabled_tools: Set[str] = field(default_factory=set)
     step_mode: bool = False
-    available_tools: List[str] = field(default_factory=list)
-    
+    # server -> [tool names]; filled from the live MCP registry at session
+    # start (was declared List[str] and never populated, so /tools-list was
+    # permanently dead).
+    available_tools: Dict[str, List[str]] = field(default_factory=dict)
+
+    # --- operator control plane (mid-turn input, pause, approvals) ---------
+    # Set by /pf (force pause) or Ctrl-C mid-turn; the agent loop drops the
+    # in-flight LLM request / tool call and stops immediately.
+    abort_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    # Plain text typed while the agent is running; delivered to the model at
+    # the next turn boundary.
+    inbox: List[str] = field(default_factory=list)
+    inbox_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    agent_busy: bool = False
+    # Paused in the middle of a task: /resume continues it.
+    resume_pending: bool = False
+    quit_requested: bool = False
+    # Approval-menu exceptions: option 6 -> "task" (cleared when the current
+    # task finishes), option 7 -> "session".
+    gate_exceptions: Dict[str, Set[str]] = field(
+        default_factory=lambda: {"task": set(), "session": set()})
+    gate_exception_labels: Dict[str, str] = field(default_factory=dict)
+    # /think display: short | full | off
+    think_mode: str = "short"
+    last_reasoning: str = ""
+    # Called (main thread) when a force pause is requested: cancel the HTTP
+    # request, cancel MCP calls, resolve any open approval prompt.
+    force_pause_hooks: List[Callable[[], None]] = field(default_factory=list, repr=False)
+    gate_event_hook: Optional[Callable[[Dict[str, Any]], None]] = field(default=None, repr=False)
+    # Returns {server: [{"name", "description"}]} from the live registry.
+    tool_catalog_provider: Optional[Callable[[], Dict[str, List[Dict[str, str]]]]] = field(
+        default=None, repr=False)
+
+    # --- /regenerate -------------------------------------------------------
+    # Every reply shown to the operator gets a number (#1, #2, ...). The
+    # number maps to that reply's assistant message dict in the conversation
+    # list, matched by identity, so trimming and in-place edits can't mis-map
+    # it. Only the interactive REPL numbers replies (one-shot mode has no
+    # prompt to regenerate from).
+    number_responses: bool = False
+    response_counter: int = 0
+    response_marks: Dict[int, Dict[str, Any]] = field(default_factory=dict, repr=False)
+    # (queued plan step, assistant message that proposed it) — lets /regenerate
+    # drop the steps of a plan it redoes instead of executing both plans.
+    plan_step_owners: List[Any] = field(default_factory=list, repr=False)
+
     @property
     def tokens_remaining(self) -> int:
         return self.model_config.context_limit - self.tokens_used
@@ -365,7 +464,11 @@ Tokens remaining: {state.tokens_remaining:,}
 Estimated runway: ~{state.runway_turns} turns at current burn rate
 Tool calls this session: {state.tool_call_count} ({state.tool_failure_count} failed)
 Turn: {state.turn_count}
+Trust tier (current — overrides the Trust Level in the opening prompt if they differ): {state.trust_tier} (level {tier_level_of(state)})
 """
+    disabled = sorted(getattr(state, "disabled_tools", set()) or [])
+    if disabled:
+        block += f"Disabled by operator (do not call): {', '.join(disabled)}\n"
     
     if failure_summary:
         block += f"\nRecent tool failures:\n{failure_summary}\n"

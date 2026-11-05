@@ -16,53 +16,19 @@ from dataclasses import dataclass
 from .config import COLORS, HOSTNAME
 
 # =============================================================================
-# USER INPUT (prompt_toolkit primary, readline-safe fallback)
+# USER INPUT
 # =============================================================================
 #
-# Raw ANSI escape codes in an input() prompt corrupt GNU readline's cursor
-# math (every escape byte is counted as a printable column), which is what
-# made typed input wrap on top of itself. prompt_toolkit handles colors and
-# widths correctly and gives us proper line editing. If prompt_toolkit is
-# not installed we fall back to input() with the escape sequences wrapped
-# in readline's \001/\002 "ignore" markers so the cursor math stays correct.
+# All terminal input goes through inputhub (readline by default — the old
+# fallback never imported readline, which is why arrow keys printed ^[[D).
+# read_input() is kept for older call sites.
 
-try:
-    from prompt_toolkit import PromptSession
-    from prompt_toolkit.formatted_text import ANSI as _PTANSI
-    _HAS_PROMPT_TOOLKIT = True
-except ImportError:  # pragma: no cover - depends on environment
-    PromptSession = None
-    _PTANSI = None
-    _HAS_PROMPT_TOOLKIT = False
-
-_prompt_session: "Optional[PromptSession]" = None
-
-_ANSI_SEQ_RE = re.compile(r"(\x1b\[[0-9;]*m)")
-
-
-def _get_prompt_session() -> "PromptSession":
-    """Lazily create the shared PromptSession (multiline off by default)."""
-    global _prompt_session
-    if _prompt_session is None:
-        _prompt_session = PromptSession(multiline=False)
-    return _prompt_session
-
-
-def _wrap_readline_escapes(prompt: str) -> str:
-    """Wrap ANSI escapes in readline's \\001/\\002 non-printing markers."""
-    return _ANSI_SEQ_RE.sub(lambda m: "\x01" + m.group(1) + "\x02", prompt)
+from .inputhub import get_hub, strip_ansi  # noqa: E402
 
 
 def read_input(prompt: str = "") -> str:
-    """Read one line of user input with an ANSI-colored prompt.
-
-    Primary path: prompt_toolkit (correct width/color handling, persistent
-    history). Fallback: builtin input() with \\001/\\002-wrapped escapes.
-    Raises EOFError/KeyboardInterrupt just like input().
-    """
-    if _HAS_PROMPT_TOOLKIT and sys.stdin.isatty():
-        return _get_prompt_session().prompt(_PTANSI(prompt))
-    return input(_wrap_readline_escapes(prompt))
+    """Read one line from the operator (raises EOFError/KeyboardInterrupt)."""
+    return get_hub().read_line(prompt)
 
 
 # =============================================================================
@@ -289,56 +255,42 @@ def print_tool_denied(tool: str, reason: str):
 # =============================================================================
 
 def prompt_approval(action: str, details: str, options: list[str] = None) -> str:
-    """Prompt user for approval with options."""
+    """y/n style approval (used by /tier and /apply). Fails closed to "n"."""
     if options is None:
         options = ["y", "n"]
-    
     print()
     print_warning("┌─ APPROVAL REQUIRED " + "─" * 50)
     print_warning(f"│ Action: {action}")
     print_warning(f"│ {details}")
     print_warning("│")
-    
-    options_str = "/".join(options)
-    print_warning(f"│ Options: [{options_str}]")
+    print_warning(f"│ Options: [{'/'.join(options)}]")
     print_warning("└" + "─" * 69)
-    
-    try:
-        response = read_input(f"{COLORS.COMMAND}  > {COLORS.RESET}").strip().lower()
-        # Fail CLOSED: empty input defaults to deny, never approve.
-        return response if response else "n"
-    except (EOFError, KeyboardInterrupt):
-        print()
+    ans = get_hub().ask(f"{COLORS.COMMAND}  [{'/'.join(options)}] › {COLORS.RESET}", kind="yn")
+    if ans.kind != "line":
         return "n"
+    response = ans.text.strip().lower()
+    if response in ("yes",):
+        response = "y"
+    if response in ("no",):
+        response = "n"
+    return response if response else "n"
+
 
 def prompt_choice(title: str, options: dict[str, str]) -> str:
-    """Prompt user to choose from numbered options.
-
-    SECURITY: fails CLOSED. Trust-gate option dicts put "Allow" at "1" and
-    "Deny" at "2"; empty input, EOF, and Ctrl-C all resolve to the deny
-    option, and unrecognized input re-prompts instead of silently picking
-    option 1. The deny key is "2" when present, otherwise the last key.
-    """
+    """Numbered choice (legacy). Fails CLOSED: empty/EOF/Ctrl-C -> deny key."""
     print()
-    print_warning(f"┌─ {title} " + "─" * (60 - len(title)))
-
+    print_warning(f"┌─ {title} " + "─" * max(4, 60 - len(title)))
     for key, desc in options.items():
         print_warning(f"│  [{key}] {desc}")
-
     print_warning("└" + "─" * 69)
-
     keys = list(options.keys())
     deny_key = "2" if "2" in options else keys[-1]
-
     while True:
-        try:
-            response = read_input(f"{COLORS.COMMAND}  Choice: {COLORS.RESET}").strip()
-        except (EOFError, KeyboardInterrupt):
-            # Panic-Ctrl-C / piped stdin at a security gate => deny.
-            print()
+        ans = get_hub().ask(f"{COLORS.COMMAND}  Choice › {COLORS.RESET}", kind="choice")
+        if ans.kind != "line":
             return deny_key
+        response = ans.text.strip()
         if not response:
-            # Enter at a security gate => deny, never allow.
             return deny_key
         if response in options:
             return response
@@ -348,9 +300,12 @@ def prompt_choice(title: str, options: dict[str, str]) -> str:
 # CONVERSATION FORMATTING
 # =============================================================================
 
-def print_ognee_response(text: str):
-    """Print OGneey response."""
+def print_ognee_response(text: str, response_id: Optional[int] = None):
+    """Print OGneey response. With a response_id, a footer under the reply
+    names the /regenerate command for it (every reply keeps its own)."""
     print(f"\n{COLORS.OGNEE}OGneey:{COLORS.RESET} {COLORS.CONVERSATION}{text}{COLORS.RESET}")
+    if response_id is not None:
+        print_dim(f"  #{response_id} · ↻ /regen {response_id}")
 
 def print_ognee_thinking():
     """Print thinking indicator."""
@@ -413,66 +368,27 @@ def print_context_warning(tokens_remaining: int, threshold: int):
 # SLASH COMMAND HELP
 # =============================================================================
 
-def print_commands_help():
-    """Print available slash commands."""
+def print_commands_help(sections=None):
+    """Print slash-command help. ``sections`` is built from the live command
+    registry by commands.py: [(section, [(usage, aliases, description, midturn)])]."""
     print()
-    print_system("Available commands:")
+    print_system("Available commands  (⚡ = works while OGneey is running)")
     print()
-    
-    sections = [
-        ("Control", [
-            ("/pause", "Halt agent, wait for input"),
-            ("/resume", "Resume from pause"),
-            ("/quit", "End session gracefully"),
-            ("/continue", "Load continuation from previous session"),
-        ]),
-        ("Tools", [
-            ("/tools-off", "Disable all tool calls (chat-only mode)"),
-            ("/tools-on", "Enable tool calls"),
-            ("/disable <tool>", "Disable specific tool or server"),
-            ("/enable <tool>", "Re-enable a disabled tool"),
-            ("/disabled", "List disabled tools"),
-            ("/tools-list", "List all available tools"),
-        ]),
-        ("Voice", [
-            ("/speak-on", "Enable TTS output"),
-            ("/speak-off", "Disable TTS output"),
-            ("/say <text>", "Manually speak text"),
-        ]),
-        ("Plan Mode", [
-            ("/plan", "Enter plan mode (propose, don't execute)"),
-            ("/execute", "Execute the pending plan"),
-            ("/clear", "Discard plan and exit plan mode"),
-            ("/plan-off", "Exit plan mode without executing"),
-            ("/step", "Execute one tool call, then pause"),
-        ]),
-        ("Shadow Files", [
-            ("/diff", "Show pending shadow file changes"),
-            ("/apply", "Apply shadow changes to real files"),
-            ("/discard-shadow", "Discard all shadow changes"),
-        ]),
-        ("Session", [
-            ("/status", "Show current session status"),
-            ("/tokens", "Show detailed token usage"),
-            ("/recap", "Request session summary from OGneey"),
-            ("/save", "Force save session checkpoint"),
-            ("/prompt", "View/modify system prompt"),
-        ]),
-        ("Remote", [
-            ("/ssh <host> <cmd>", "Run command on remote host"),
-            ("/hosts", "List available hosts"),
-        ]),
-        ("Other", [
-            ("/tier [0-3]", "View or change trust tier"),
-            ("/help", "Show this help"),
-        ]),
-    ]
-    
-    for section_name, commands in sections:
+    for section_name, rows in (sections or []):
         print(f"  {COLORS.BOLD}{section_name}{COLORS.RESET}")
-        for cmd, desc in commands:
-            print(f"    {COLORS.COMMAND}{cmd:20}{COLORS.RESET} {desc}")
+        for usage, aliases, desc, midturn in rows:
+            bolt = "⚡" if midturn else " "
+            head = usage if len(usage) <= 22 else usage.split(" ")[0] + " …"
+            shown = " ".join("/" + a for a in aliases[:4])
+            if len(aliases) > 4:
+                shown += f" +{len(aliases) - 4}"
+            alias_txt = f"  {COLORS.DIM}{shown}{COLORS.RESET}" if aliases else ""
+            print(f"   {bolt} {COLORS.COMMAND}{head:24}{COLORS.RESET} {desc}{alias_txt}")
         print()
+    print_dim("  /help <command> for details and every alias.")
+    print_dim("  Typing while OGneey works: plain text is delivered at the next turn boundary.")
+    print_dim("  Ctrl-C while it works = /pf (stop now). Ctrl-C twice at an idle prompt = quit.")
+    print()
 
 # =============================================================================
 # UTILITY

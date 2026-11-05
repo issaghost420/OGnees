@@ -118,20 +118,25 @@ class ToolOutputBuffer:
             return []
 
         lines = so.full_text.split('\n')
-        matches = []
-        matched_line_nums = set()
+        q = query.lower()
+        hits = [i for i, line in enumerate(lines) if q in line.lower()]
 
-        for i, line in enumerate(lines):
-            if query.lower() in line.lower():
-                matched_line_nums.add(i)
-
-        # Build context windows
-        result = []
-        for ln in sorted(matched_line_nums):
+        # Merge overlapping context windows so nearby matches don't print
+        # the same lines twice (that cost the model tokens for nothing).
+        windows: List[List[int]] = []
+        for ln in hits:
             start = max(0, ln - context_lines)
             end = min(len(lines), ln + context_lines + 1)
+            if windows and start <= windows[-1][1]:
+                windows[-1][1] = max(windows[-1][1], end)
+            else:
+                windows.append([start, end])
+
+        hit_set = set(hits)
+        result = []
+        for start, end in windows:
             for j in range(start, end):
-                marker = ">>>" if j == ln else "   "
+                marker = ">>>" if j in hit_set else "   "
                 result.append((j + 1, f"{marker} {lines[j]}"))
             result.append((0, "---"))  # separator (line 0 is a sentinel)
         return result

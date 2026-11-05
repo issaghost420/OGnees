@@ -209,6 +209,8 @@ class MCPServer:
         # Event-driven response delivery instead of CPU-wasting polling.
         self._pending_responses: Dict[int, Any] = {}
         self._pending_events: Dict[int, threading.Event] = {}
+        # method name per in-flight request id (lets /pf cancel tools/call)
+        self._pending_methods: Dict[int, str] = {}
         self._lock = threading.Lock()        # guards pending maps + request id
         self._write_lock = threading.Lock()  # serializes ALL stdin writes
         self._running = False
@@ -473,6 +475,7 @@ class MCPServer:
                 # Register the event before sending to avoid the race where
                 # the response arrives before we start waiting.
                 self._pending_events[req_id] = event
+                self._pending_methods[req_id] = method
 
             err = self._send_raw(request)
             if err is not None:
@@ -482,12 +485,14 @@ class MCPServer:
 
             if event.wait(timeout=timeout):
                 with self._lock:
+                    self._pending_methods.pop(req_id, None)
                     return self._pending_responses.pop(req_id, {})
             else:
                 # Timeout: clean up the stale entry
                 with self._lock:
                     self._pending_events.pop(req_id, None)
                     self._pending_responses.pop(req_id, None)
+                    self._pending_methods.pop(req_id, None)
                 return {"error": {"message": f"Timeout waiting for {method} response"}}
 
         except Exception as e:
@@ -496,7 +501,33 @@ class MCPServer:
                 with self._lock:
                     self._pending_events.pop(req_id, None)
                     self._pending_responses.pop(req_id, None)
+                    self._pending_methods.pop(req_id, None)
             return {"error": {"message": str(e)}}
+
+    def cancel_inflight(self, reason: str = "cancelled by operator (force pause)") -> int:
+        """Cancel every in-flight ``tools/call`` on this server.
+
+        Each waiting caller is released immediately with an error result, and
+        the server is sent the standard MCP ``notifications/cancelled`` so a
+        server that supports cancellation can stop the work (one that doesn't
+        will finish it in the background; its late reply is dropped).
+        Returns the number of calls cancelled.
+        """
+        released = []
+        with self._lock:
+            for rid, meth in list(self._pending_methods.items()):
+                if meth != "tools/call":
+                    continue
+                event = self._pending_events.pop(rid, None)
+                self._pending_methods.pop(rid, None)
+                if event is not None:
+                    self._pending_responses[rid] = {"error": {"message": reason}}
+                    released.append((rid, event))
+        for rid, event in released:
+            self._send_notification("notifications/cancelled",
+                                    {"requestId": rid, "reason": reason})
+            event.set()
+        return len(released)
 
     def _send_notification(self, method: str, params: dict = None) -> dict:
         """Send a JSON-RPC notification (no id, no reply expected).
@@ -1160,6 +1191,19 @@ class MCPManager:
                 print(f"    • {name}: {desc}...")
 
         print()
+
+    def cancel_all_inflight(self, reason: str = "cancelled by operator (force pause)") -> int:
+        """Cancel in-flight tool calls on every stdio server (used by /pf)."""
+        total = 0
+        for server in list(self.servers.values()):
+            cancel = getattr(server, "cancel_inflight", None)
+            if cancel is None:
+                continue
+            try:
+                total += cancel(reason)
+            except Exception:
+                pass
+        return total
 
     def stop_all(self):
         """Stop all MCP servers."""

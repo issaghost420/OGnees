@@ -300,9 +300,12 @@ def prompt_choice(title: str, options: dict[str, str]) -> str:
 # CONVERSATION FORMATTING
 # =============================================================================
 
-def print_ognee_response(text: str):
-    """Print OGneey response."""
+def print_ognee_response(text: str, response_id: Optional[int] = None):
+    """Print OGneey response. With a response_id, a footer under the reply
+    names the /regenerate command for it (every reply keeps its own)."""
     print(f"\n{COLORS.OGNEE}OGneey:{COLORS.RESET} {COLORS.CONVERSATION}{text}{COLORS.RESET}")
+    if response_id is not None:
+        print_dim(f"  #{response_id} · ↻ /regen {response_id}")
 
 def print_ognee_thinking():
     """Print thinking indicator."""

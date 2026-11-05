@@ -20,6 +20,7 @@ import urllib.parse
 import requests
 import wcwidth
 from collections import Counter
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional, Dict, List, Any, Tuple
 from wcwidth import wcswidth
@@ -49,6 +50,10 @@ from .context import (
     save_continuation_scroll,
     count_tokens,
     count_message_tokens,
+    reserve_response_id,
+    bind_response,
+    latest_response_id,
+    resume_target,
 )
 from .commands import (
     is_command,
@@ -83,6 +88,7 @@ from .display import (
     print_tool_result,
     print_dim,
     read_input,
+    prompt_approval,
     COLORS,
 )
 
@@ -1364,7 +1370,7 @@ def _show_reasoning(state: Session, logger: SessionLogger, reasoning: str):
 
 
 async def agent_loop(
-    task: str,
+    task: Optional[str],
     mcp: MCPManager,
     state: Session,
     logger: SessionLogger,
@@ -1377,6 +1383,10 @@ async def agent_loop(
 
     Returns True if task completed (or was paused) cleanly, False on error.
 
+    ``task=None`` with an existing ``messages`` list continues from the
+    history as it stands, without adding a user turn — that's how
+    /regenerate re-asks the model after rewinding to just before a reply.
+
     Operator control points (input arrives on another thread while this runs):
       * top of every iteration: /pf (abort), /p (pause), mid-turn messages
       * the LLM request and the tool batch are raced against /pf
@@ -1387,6 +1397,8 @@ async def agent_loop(
 
     # Initialize messages if not provided
     if messages is None:
+        if task is None:
+            raise ValueError("agent_loop needs a task or an existing conversation")
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": task}
@@ -1399,7 +1411,7 @@ async def agent_loop(
             messages[0]["content"] += mcp.get_tools_prompt(
                 profile=profile, extra_tools=get_local_tools()
             )
-    else:
+    elif task is not None:
         # Append new task (merge if the history already ends on a user turn,
         # e.g. after a force pause)
         if messages and messages[-1].get("role") == "user" and isinstance(messages[-1].get("content"), str):
@@ -1412,8 +1424,9 @@ async def agent_loop(
         if "## Additional Instructions" not in messages[0]["content"]:
             messages[0]["content"] += f"\n\n## Additional Instructions\n{state.custom_prompt}"
 
-    # Log user message
-    logger.log_user_message(task)
+    # Log user message (a regenerate re-asks without one)
+    if task is not None:
+        logger.log_user_message(task)
 
     # Handle plan mode toggle (tools already in system prompt from session
     # init). The marker is added when plan mode is on AND removed when it is
@@ -1455,9 +1468,12 @@ async def agent_loop(
             state.turn_count += 1
 
             if text:
-                messages.append({"role": "assistant", "content": text})
+                reply = {"role": "assistant", "content": text}
+                messages.append(reply)
                 if not _looks_like_tool_json(text):
-                    print_ognee_response(text)
+                    rid = reserve_response_id(state)
+                    bind_response(state, rid, reply)
+                    print_ognee_response(text, rid)
                     logger.log_assistant_message(text, usage.get("total_tokens", 0))
             else:
                 print_dim("  (no text response)")
@@ -1529,6 +1545,7 @@ async def agent_loop(
 
         inflight = None
         text = ""
+        shown_rid = None   # number printed under this reply (bound once it's in history)
         try:
             # Call LLM — with native tool schemas when the model profile
             # supports them, otherwise rely on the profiled text format.
@@ -1808,7 +1825,8 @@ async def agent_loop(
 
             if text:
                 if not _looks_like_tool_json(text):
-                    print_ognee_response(text)
+                    shown_rid = reserve_response_id(state)
+                    print_ognee_response(text, shown_rid)
                     logger.log_assistant_message(text, usage.get("total_tokens", 0))
             else:
                 print_dim("  (no text response)")
@@ -1830,6 +1848,7 @@ async def agent_loop(
                         "tool_calls": raw_msg.get("tool_calls", []),
                     }
                     messages.append(assistant_msg)
+                    bind_response(state, shown_rid, assistant_msg)
                     for tr_msg in format_tool_results_for_llm(tool_results, tool_calls):
                         if len(tr_msg.get("content", "")) > MAX_TOOL_RESULT_CHARS:
                             tr_msg["content"] = (
@@ -1865,7 +1884,9 @@ async def agent_loop(
                             f"Use /execute to run them or /clear to discard."
                         )
 
-                    messages.append({"role": "assistant", "content": text or "Using tools..."})
+                    assistant_msg = {"role": "assistant", "content": text or "Using tools..."}
+                    messages.append(assistant_msg)
+                    bind_response(state, shown_rid, assistant_msg)
                     messages.append({
                         "role": "user",
                         "content": (
@@ -1892,7 +1913,9 @@ async def agent_loop(
             else:
                 # No tool calls — model chose to respond conversationally.
                 # Turn is complete. Record and exit.
-                messages.append({"role": "assistant", "content": text})
+                reply = {"role": "assistant", "content": text}
+                messages.append(reply)
+                bind_response(state, shown_rid, reply)
 
                 _trim_messages(messages, state)
 
@@ -1988,6 +2011,124 @@ async def execute_plan_queue(
     return tool_results
 
 
+# =============================================================================
+# REGENERATE
+# =============================================================================
+
+@dataclass
+class RegenPlan:
+    """What /regenerate N would do to the conversation (nothing is changed
+    until apply_regenerate)."""
+    response_id: int
+    index: int                    # position of reply #N in messages
+    old_text: str                 # what reply #N said (kept in the session log)
+    dropped_messages: int         # messages removed, reply #N included
+    later_replies: List[int]      # reply numbers after #N that go away too
+    operator_turns: int           # operator messages after #N that go away
+    tool_calls_ran: int           # tool calls in the dropped span (already executed)
+
+    @property
+    def is_latest(self) -> bool:
+        return not self.later_replies
+
+    @property
+    def needs_confirm(self) -> bool:
+        """Redoing the newest plain reply is instant; anything that throws
+        away later turns, or skips over tool calls that already ran, asks."""
+        return bool(self.later_replies or self.operator_turns or self.tool_calls_ran)
+
+
+def _is_tool_results_turn(msg: Dict[str, Any]) -> bool:
+    content = msg.get("content")
+    return isinstance(content, str) and content.startswith("[TOOL RESULTS]")
+
+
+def _is_operator_turn(msg: Dict[str, Any]) -> bool:
+    """A user-role message the operator wrote (not tool results / notices)."""
+    if msg.get("role") != "user":
+        return False
+    content = msg.get("content")
+    if not isinstance(content, str):
+        return True
+    return not (content.startswith("[TOOL RESULTS]") or content.startswith("SYSTEM NOTICE")
+                or content.startswith("You received tool results")
+                or content.startswith("Your tool calls still")
+                or (content.startswith("[") and "earlier messages trimmed" in content))
+
+
+def plan_regenerate(messages: list, state: Session,
+                    response_id: Optional[int] = None) -> Tuple[Optional[RegenPlan], str]:
+    """Work out how to redo reply #response_id (default: the latest one).
+
+    Returns (plan, "") or (None, reason it can't be done).
+    """
+    marks = getattr(state, "response_marks", {}) or {}
+    if not marks:
+        return None, "No OGneey replies to regenerate yet."
+    rid = response_id if response_id is not None else latest_response_id(state)
+    target = marks.get(rid)
+    if target is None:
+        known = sorted(marks)
+        return None, (f"There's no reply #{rid}. Replies you can redo: "
+                      + ", ".join(f"#{k}" for k in known[-10:]))
+    index = next((i for i, m in enumerate(messages) if m is target), None)
+    if index is None or index == 0:
+        return None, (f"Reply #{rid} has been trimmed out of OGneey's context window, "
+                      "so it can't be regenerated.")
+    dropped = messages[index:]
+    tool_calls_ran = 0
+    for m in dropped:
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            tool_calls_ran += len(m["tool_calls"])
+        elif _is_tool_results_turn(m):
+            tool_calls_ran += max(1, m["content"].count("\n=== "))
+    later = sorted(k for k, m in marks.items() if k > rid)
+    return RegenPlan(
+        response_id=rid,
+        index=index,
+        old_text=target.get("content") or "",
+        dropped_messages=len(dropped),
+        later_replies=later,
+        operator_turns=sum(1 for m in dropped[1:] if _is_operator_turn(m)),
+        tool_calls_ran=tool_calls_ran,
+    ), ""
+
+
+def apply_regenerate(messages: list, state: Session, plan: RegenPlan,
+                     logger: Optional[SessionLogger] = None) -> None:
+    """Rewind the conversation to just before reply #N."""
+    del messages[plan.index:]
+    for k in [k for k in state.response_marks if k >= plan.response_id]:
+        del state.response_marks[k]
+    # Re-estimate context use for the shorter history (the next API reply
+    # replaces this with the server's real count).
+    update_token_count(state, messages=messages)
+    if logger is not None:
+        logger.log_event("regenerate", {
+            "response": plan.response_id,
+            "replaced_text": redact_secrets(plan.old_text),
+            "dropped_messages": plan.dropped_messages,
+            "dropped_replies": plan.later_replies,
+            "tool_calls_not_undone": plan.tool_calls_ran,
+        })
+
+
+def describe_regen_plan(plan: RegenPlan) -> str:
+    lines = [f"Rewinds the conversation to just before reply #{plan.response_id}."]
+    later = plan.later_replies
+    if len(later) == 1:
+        lines.append(f"Reply #{later[0]} after it leaves OGneey's context.")
+    elif later:
+        lines.append(f"The {len(later)} replies after it (#{later[0]}–#{later[-1]}) leave OGneey's context.")
+    if plan.operator_turns:
+        lines.append(f"{plan.operator_turns} message(s) you sent after it leave OGneey's context.")
+    if plan.tool_calls_ran:
+        lines.append(f"{plan.tool_calls_ran} tool call(s) were made in that span — rewinding "
+                     "does NOT undo any that ran (written files stay written).")
+    lines.append("Everything dropped stays in the session log.")
+    return "\n│ ".join(lines)
+
+
 RESUME_NUDGE = (
     "[The operator resumed the session. Continue the task from where you left off. "
     "If you're not sure what's next, or you were waiting on something, say so.]"
@@ -2059,9 +2200,12 @@ class AgentRunner:
         self.executor.shutdown(wait=False, cancel_futures=True)
 
 
-async def _run_turns(text: str, mcp: MCPManager, state: Session, logger: SessionLogger,
+async def _run_turns(text: Optional[str], mcp: MCPManager, state: Session, logger: SessionLogger,
                      system_prompt: str, messages: list, new_task: bool = True):
-    """One operator request, plus anything typed while it was finishing."""
+    """One operator request, plus anything typed while it was finishing.
+
+    ``text=None`` re-asks the model from the history as it stands (/regenerate).
+    """
     try:
         task = text
         fresh = new_task
@@ -2159,6 +2303,7 @@ def interactive_session(mcp: MCPManager, state: Session, logger: SessionLogger, 
         messages[0]["content"] += f"\n\n## Additional Instructions\n{state.custom_prompt}"
 
     # ---- wiring --------------------------------------------------------------
+    state.number_responses = True        # "#N · ↻ /regen N" under every reply
     state.available_tools = _tool_names(mcp)
     state.tool_catalog_provider = lambda: _tool_catalog(mcp)
 
@@ -2198,8 +2343,36 @@ def interactive_session(mcp: MCPManager, state: Session, logger: SessionLogger, 
         runner.submit(coro)
         hub.refresh_prompt()
 
-    def start_task(text: str, new_task: bool = True):
+    def start_task(text: Optional[str], new_task: bool = True):
         start(_run_turns(text, mcp, state, logger, system_prompt, messages, new_task))
+
+    def regenerate(response_id: Optional[int]):
+        """/regenerate [N] — runs on the main thread while the agent is idle."""
+        if state.mode is SessionState.PAUSED and state.queued_messages:
+            print_warning(f"  You have {len(state.queued_messages)} message(s) queued while paused — "
+                          "/r delivers them first; regenerate after that.")
+            return
+        plan, why = plan_regenerate(messages, state, response_id)
+        if plan is None:
+            print_warning(f"  {why}")
+            return
+        if plan.needs_confirm:
+            answer = prompt_approval(f"/regenerate #{plan.response_id}", describe_regen_plan(plan))
+            if answer != "y":
+                print_system("  Nothing changed.")
+                return
+        apply_regenerate(messages, state, plan, logger)
+        if state.mode is SessionState.PAUSED:
+            # the redo replaces whatever was paused
+            transition_state(state, resume_target(state))
+            state.resume_pending = False
+        if DEFAULT_TEMPERATURE <= 0:
+            print_dim("  (temperature is 0 — the redo will probably come out the same; "
+                      "set OGNEE_TEMPERATURE above 0 for variety)")
+        print_system(f"  ↻ Regenerating reply #{plan.response_id}…")
+        # Rewinding past later turns starts a fresh task (task-scoped approval
+        # exceptions reset); redoing the newest reply keeps them.
+        start_task(None, new_task=not plan.is_latest)
 
     def run_command_line(line: str) -> str:
         """Execute a slash command on the main thread; returns its canonical name."""
@@ -2231,6 +2404,8 @@ def interactive_session(mcp: MCPManager, state: Session, logger: SessionLogger, 
                 print_dim("  📥 queued — /r delivers it")
             else:
                 start_task(msg)
+        elif "regenerate" in data:
+            regenerate(data["regenerate"])
         elif "execute_plan" in data:
             start(_run_plan(data["execute_plan"], mcp, state, logger, system_prompt, messages))
         elif "ssh_command" in data:
@@ -2282,7 +2457,7 @@ def interactive_session(mcp: MCPManager, state: Session, logger: SessionLogger, 
 {row(f"Tools: {tool_count}")}
 {row("")}
 {row("Type while it works: /p pause · /pf stop now · /tier N · plain text = steer")}
-{row("Commands: /help /status /tools /think /exceptions /policy /quit")}
+{row("Commands: /help /status /tools /regen /think /exceptions /policy /quit")}
 ╰{"─" * (INNER_WIDTH)}╯
 """)
     print_dim(f"  ⌨  input: {hub.describe()}")

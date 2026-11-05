@@ -94,7 +94,7 @@ _canonical: Dict[str, str] = {}          # name or alias -> canonical name
 _meta: Dict[str, Dict[str, Any]] = {}    # canonical name -> help metadata
 
 # Commands that would race a running agent. Everything else works mid-turn.
-BUSY_REFUSED = {"execute", "apply", "discard-shadow", "clear", "continue"}
+BUSY_REFUSED = {"execute", "apply", "discard-shadow", "clear", "continue", "regenerate"}
 
 _SECTION_ORDER = ["Control", "Tools & permissions", "Session", "Plan mode",
                   "Shadow files", "Remote", "Voice", "Other"]
@@ -231,6 +231,8 @@ def command_arg_choices(cmd: str, state: Session) -> List[str]:
     if name in ("disable", "enable", "tools-list"):
         extra = ["all"] if name == "enable" else []
         return _tool_keys(state) + extra
+    if name == "regenerate":
+        return [str(k) for k in sorted(getattr(state, "response_marks", {}) or {})]
     if name == "exceptions":
         return ["list", "clear"]
     if name == "policy":
@@ -377,6 +379,22 @@ def cmd_pickup(state: Session, args: List[str]) -> CommandResponse:
 # =============================================================================
 # TOOL CONTROL
 # =============================================================================
+
+@command("regenerate", aliases=["regen", "rg", "retry", "redo", "reroll"], section="Session",
+         usage="/regenerate [N]")
+def cmd_regenerate(state: Session, args: List[str]) -> CommandResponse:
+    """Redo an OGneey reply. With no number it redoes the latest reply;
+    /regenerate 3 redoes reply #3 (the number under each reply).
+    Redoing an earlier reply rewinds the conversation to just before it, so
+    the replies and messages after it leave OGneey's context — you're asked
+    first, and everything dropped stays in the session log. Tool calls that
+    already ran are not undone."""
+    if len(args) > 1 or (args and not args[0].lstrip("#").isdigit()):
+        print_warning("Usage: /regenerate [N]  — N is the #number under an OGneey reply")
+        return CommandResponse(result=CommandResult.HANDLED)
+    target = int(args[0].lstrip("#")) if args else None
+    return CommandResponse(result=CommandResult.HANDLED, data={"regenerate": target})
+
 
 @command("speak-on", aliases=["speakon", "voice-on", "tts-on"], section="Voice", strict=True)
 def cmd_speak_on(state: Session, args: List[str]) -> CommandResponse:

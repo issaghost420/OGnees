@@ -217,6 +217,25 @@ def drain_queued_messages(state: "Session") -> List[str]:
     return queued
 
 
+def reserve_response_id(state: "Session") -> Optional[int]:
+    """Number for the reply about to be printed (None outside the REPL)."""
+    if not getattr(state, "number_responses", False):
+        return None
+    state.response_counter += 1
+    return state.response_counter
+
+
+def bind_response(state: "Session", response_id: Optional[int], message: Dict[str, Any]) -> None:
+    """Tie a printed reply number to its assistant message in the history."""
+    if response_id is not None:
+        state.response_marks[response_id] = message
+
+
+def latest_response_id(state: "Session") -> Optional[int]:
+    marks = getattr(state, "response_marks", None) or {}
+    return max(marks) if marks else None
+
+
 def post_inbox(state: "Session", text: str) -> int:
     """Queue a message typed while the agent is running (thread-safe)."""
     with state.inbox_lock:
@@ -335,7 +354,17 @@ class Session:
     # Returns {server: [{"name", "description"}]} from the live registry.
     tool_catalog_provider: Optional[Callable[[], Dict[str, List[Dict[str, str]]]]] = field(
         default=None, repr=False)
-    
+
+    # --- /regenerate -------------------------------------------------------
+    # Every reply shown to the operator gets a number (#1, #2, ...). The
+    # number maps to that reply's assistant message dict in the conversation
+    # list, matched by identity, so trimming and in-place edits can't mis-map
+    # it. Only the interactive REPL numbers replies (one-shot mode has no
+    # prompt to regenerate from).
+    number_responses: bool = False
+    response_counter: int = 0
+    response_marks: Dict[int, Dict[str, Any]] = field(default_factory=dict, repr=False)
+
     @property
     def tokens_remaining(self) -> int:
         return self.model_config.context_limit - self.tokens_used

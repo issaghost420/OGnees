@@ -1,0 +1,71 @@
+{
+  "mcpServers": {
+    "local-files": {
+      "command": "node",
+      "args": [
+        "/home/tower/tools/mcp-servers/local-files-smart.js",
+        "/home/tower",
+        "/etc/nixos",
+        "/var/log",
+        "/var/lib",
+        "/data",
+        "/data3",
+        "/data4",
+        "/hdd2",
+        "/990",
+        "/sata",
+        "/tmp",
+        "/mnt/titan",
+        "/mnt/dacrib"
+      ]
+    },
+    "agent-memory": {
+      "command": "node",
+      "args": [
+        "/home/tower/tools/mcp-servers/node_modules/mcp-simple-memory/dist/cli.js",
+        "serve"
+      ]
+    },
+    "web-search": {
+      "command": "node",
+      "args": [
+        "/home/tower/tools/mcp-servers/node_modules/mcp-searxng/dist/index.js"
+      ],
+      "env": {
+        "SEARXNG_URL": "http://localhost:8888/sear"
+      }
+    },
+    "shell": {
+      "command": "node",
+      "args": [
+        "/home/tower/tools/mcp-servers/node_modules/mcp-shell-server/bin/server.js"
+      ]
+    },
+    "browser": {
+      "command": "node",
+      "args": [
+        "/home/tower/tools/mcp-servers/node_modules/@playwright/mcp/cli.js",
+        "--browser",
+        "chromium"
+      ],
+      "env": {
+        "PLAYWRIGHT_CHROMIUM_ARGS": "--disable-gpu --disable-software-rasterizer"
+      }
+    },
+    "git": {
+      "command": "node",
+      "args": [
+        "/home/tower/tools/mcp-servers/node_modules/mcp-git/dist/cli.js"
+      ]
+    },
+
+    "deep-research": {
+      "command": "/run/current-system/sw/bin/deepresearch-mcp",
+      "args": [],
+      "cwd": "/home/tower/tools/mcp-servers/deepresearch",
+      "env": {
+        "RESEARCH_CONFIG": "/home/tower/tools/mcp-servers/deepresearch/config/research.yml"
+      }
+    }
+  }
+}

@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ognee"
+version = "1.1.0"
+description = "Local-first autonomous agent framework for OpenAI-compatible LLMs with MCP tools and trust-tiered permission gates"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+    "requests==2.32.3",
+    "wcwidth==0.2.13",
+    "prompt_toolkit==3.0.51",
+]
+
+[project.scripts]
+ognee = "backend.ognee:main"
+
+[tool.setuptools]
+# The repository directory IS the "backend" package (modules live at the
+# repo root and use relative imports), so map it explicitly.
+package-dir = { "backend" = "." }
+packages = ["backend"]

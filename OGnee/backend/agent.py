@@ -349,6 +349,14 @@ def _trim_messages(messages: list, state: Session):
     max_keep_from = max(2, len(messages) - MIN_RECENT_MESSAGES)
     keep_from = min(groups[keep_from_group][0] if keep_from_group < len(groups) else len(messages),
                     max_keep_from)
+    # The MIN_RECENT_MESSAGES floor is a raw index and can land inside a
+    # group (e.g. on the 3rd of 6 role:"tool" replies). Back up to the
+    # group's start so the tool_calls message is kept with its replies —
+    # an orphaned role:"tool" message makes the API reject the request.
+    for group in groups:
+        if group[0] < keep_from <= group[-1]:
+            keep_from = group[0]
+            break
 
     if keep_from <= 2:
         return  # keeping everything already

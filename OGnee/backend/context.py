@@ -6,6 +6,7 @@ The brain's awareness of its own limits. Tracks token usage,
 injects state into prompts, triggers hard stops when context runs low.
 """
 
+import json
 import os
 import re
 import threading
@@ -120,10 +121,11 @@ def count_message_tokens(
         elif isinstance(content, list):
             # Multi-part content (text + tool calls etc)
             for part in content:
-                if isinstance(part, dict):
-                    total += count_tokens(str(part))
-                else:
-                    total += count_tokens(str(part))
+                total += count_tokens(str(part))
+        # Native tool calls carry their arguments outside "content" (a
+        # write_file call can be most of the message); count them too.
+        if msg.get("tool_calls"):
+            total += count_tokens(json.dumps(msg["tool_calls"], default=str))
     return total
 
 

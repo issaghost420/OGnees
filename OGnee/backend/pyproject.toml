@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ognee"
-version = "1.1.0"
+version = "1.2.0"
 description = "Local-first autonomous agent framework for OpenAI-compatible LLMs with MCP tools and trust-tiered permission gates"
 readme = "README.md"
 license = { text = "MIT" }
@@ -23,3 +23,8 @@ ognee = "backend.ognee:main"
 # repo root and use relative imports), so map it explicitly.
 package-dir = { "backend" = "." }
 packages = ["backend"]
+
+# Non-Python files the package reads at runtime. Without this an installed
+# copy silently fell back to the built-in shell policy and had no mcp.json.
+[tool.setuptools.package-data]
+backend = ["shell-policy.json", "mcp.json"]

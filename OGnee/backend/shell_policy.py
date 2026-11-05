@@ -653,7 +653,8 @@ _WRITE_PROGRAMS = {
     "nixos-rebuild", "nix-build", "nix-shell", "nix-collect-garbage", "home-manager",
     "flatpak", "apt", "apt-get", "dpkg", "snap", "brew", "inotifywait", "inotifywatch",
     "sqlite3", "psql", "mysql", "redis-cli", "crontab", "at", "batch", "hf",
-    "huggingface-cli", "wget",
+    "huggingface-cli", "wget", "srm", "wipe", "trash", "trash-put", "trash-rm",
+    "trash-empty", "gtrash",
 }
 _INTERPRETERS = {
     "python", "python3", "python2", "pypy", "pypy3", "node", "nodejs", "deno", "bun",
@@ -821,6 +822,10 @@ def segment_write_reason(seg: Segment) -> Optional[str]:
         return f"`{prog} {sub}` changes system settings"
     if prog == "ip" and any(a in ("add", "del", "delete", "set", "flush", "change", "replace") for a in args):
         return "`ip` changes network configuration"
+    if prog in ("gio", "kioclient", "kioclient5") and sub in (
+            "trash", "remove", "rm", "rename", "move", "mv", "copy", "cp", "mkdir",
+            "save", "set", "mount", "exec"):
+        return f"`{prog} {sub}` changes files"
     return None
 
 

@@ -143,7 +143,7 @@ def build_onboarding_prompt(state: Session) -> str:
         restrictions.append("- You CANNOT make network requests")
     if not tier.can_sudo:
         restrictions.append("- You CANNOT use sudo")
-    restrictions.append("- You CANNOT use rm/delete commands (permanently banned)")
+    restrictions.append("- You CANNOT run shell commands the shell policy denies (rm and other deletes included)")
     
     cap_text = "\n".join(capabilities) if capabilities else "(none)"
     rest_text = "\n".join(restrictions) if restrictions else "(none)"
@@ -246,8 +246,8 @@ Model: {state.model_name}
 
 1. **Read before write** - Always check current state before making changes
 2. **Shadow first** - Writes to protected paths go to shadow directory for review
-3. **No rm** - Delete commands are permanently banned. Not negotiable.
-4. **Respect gates** - Permission prompts exist for a reason
+3. **Shell policy** - The operator's shell policy blocks some commands outright (rm and other deletes among them) and asks before others. A blocked call comes back as [DENIED] with the reason — don't retry it or route around it with an equivalent; pick another approach or ask.
+4. **Respect gates** - Permission prompts exist for a reason. The operator may approve with a note, deny with a reason, or answer with a message instead — when they do, follow what they said.
 5. **Log everything** - Your actions are being recorded for review
 6. **Know your limits** - Watch your token usage, wrap up before context runs out
 7. **Stay on task** - Answer what's asked, don't over-expand scope unless requested
@@ -264,6 +264,11 @@ Model: {state.model_name}
 ## Task Completion
 - When you've answered the user's question, give a clear summary before stopping
 - If there's nothing more to do, say so — don't just go quiet
+
+## The operator is live
+- The operator can type while you work. Messages marked [Mid-turn message from the operator] arrive between your steps — read them before continuing; they override your plan.
+- The operator can pause you (/p) or stop you mid-step (/pf). After a stop, you'll see what was interrupted; when resumed, re-check state before redoing anything that may have partly run.
+- [SYSTEM NOTICE] lines (e.g. a trust-tier change) describe your current permissions and replace earlier ones.
 
 
 """)
@@ -285,7 +290,7 @@ Model: {state.model_name}
     if tier.can_sudo:
         can_do.append("Use sudo (logged)")
     
-    cant_do.append("Use rm/delete commands (permanently banned)")
+    cant_do.append("Run shell commands the shell policy denies (rm and other deletes included)")
     if not tier.can_write_direct:
         cant_do.append("Write directly to protected paths")
     if not tier.can_sudo:
@@ -302,6 +307,19 @@ Model: {state.model_name}
         prompt_parts.append(f"  ✗ {item}")
     prompt_parts.append("")
     
+    # Shell policy (so the model doesn't waste calls on commands that will be denied)
+    try:
+        from .shell_policy import get_policy
+        pol = get_policy()
+        prompt_parts.append("## Shell Policy (execute_command)\n")
+        prompt_parts.append("Checked per sub-command (&&, ;, |, $(...) are split). Deny wins over confirm, confirm over allow.")
+        for line in pol.summary_lines():
+            prompt_parts.append(f"- {line}")
+        prompt_parts.append("- anything else: decided by your trust tier (lower tiers ask before writes)")
+        prompt_parts.append("")
+    except Exception:
+        pass
+
     # Persistent state
     if persistent_state:
         prompt_parts.append("## Current System State\n")

@@ -361,6 +361,17 @@ class SessionLogger:
         # FIX 2: Removed ``self.entries.append(entry)``.
         self._append_jsonl(entry)
 
+    def log_reasoning(self, turn: int, text: str):
+        """Log the model's reasoning for a turn (redacted like everything else)."""
+        if not text:
+            return
+        self._append_jsonl({
+            "type": "reasoning",
+            "timestamp": datetime.now().isoformat(),
+            "turn": turn,
+            "content": text,
+        })
+
     def log_gate_decision(self, action: str, decision: str, reason: str):
         """Log a gate/permission decision."""
         entry = {

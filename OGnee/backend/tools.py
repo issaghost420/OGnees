@@ -260,6 +260,7 @@ class ToolResult:
     was_denied: bool = False
     was_redirected: bool = False
     redirect_path: Optional[str] = None
+    aborted: bool = False      # force pause (/pf) stopped this call
 
 # =============================================================================
 # FAILURE TRACKING
@@ -364,6 +365,25 @@ def get_failure_tracker() -> ToolFailureTracker:
 # TOOL EXECUTION
 # =============================================================================
 
+def _denial_label(verdict) -> str:
+    if verdict.aborted:
+        return "stopped (force pause)"
+    if verdict.paused:
+        return "not run — paused"
+    if verdict.message:
+        return "not run — your message was sent to OGneey"
+    if verdict.by_operator:
+        return "denied" + (" — reason sent to OGneey" if verdict.reason else "")
+    return "blocked by gate"
+
+
+def _with_operator_note(output: str, verdict) -> str:
+    note = (getattr(verdict, "note", "") or "").strip()
+    if not note:
+        return output
+    return f"{output}\n\n[Operator note on this call: {note}]"
+
+
 async def execute_tool_call(
     mcp_clients: Dict[str, Any],
     server: str,
@@ -388,27 +408,40 @@ async def execute_tool_call(
         # tools do, so they must pass the same gate layer (EXCLUDED_PATHS,
         # read-only tiers, network approval). Previously this branch
         # returned early and local/read_file could read ~/.ssh et al.
-        allowed, modified_args = gate_tool_call(server, tool, args, state)
-        if not allowed:
-            print_tool_denied(display_key, "Denied by gate")
+        verdict = gate_tool_call(server, tool, args, state)
+        if not verdict.allowed:
+            print_tool_denied(display_key, _denial_label(verdict))
             return ToolResult(
                 success=False,
                 output="",
-                error="Denied by permission gate",
-                was_denied=True
+                error=verdict.denial_text(),
+                was_denied=True,
+                aborted=verdict.aborted,
             )
-        if modified_args:
-            args = modified_args
+        if verdict.args:
+            args = verdict.args
 
-        result = await call_local_tool(display_key, args)  # local tools match on "local/tool_name"
+        try:
+            result = await call_local_tool(display_key, args)  # local tools match on "local/tool_name"
+        except TypeError as e:
+            result = {"error": f"bad arguments for {display_key}: {e}"}
         duration_ms = int((time.time() - start_time) * 1000)
         
         if "error" in result:
             print_tool_error(display_key, result["error"])
             return ToolResult(success=False, output="", error=result["error"], duration_ms=duration_ms)
         
-        print_tool_result(result.get("result", ""), success=True)
-        return ToolResult(success=True, output=result.get("result", ""), duration_ms=duration_ms)
+        output = result.get("result", "")
+        if len(output) > MAX_TOOL_RESULT_CHARS:
+            # Same stash-and-paginate safety net the MCP path has (local
+            # tools used to skip it and get hard-truncated with no ref).
+            buf = get_output_buffer()
+            stashed_ref, preview = buf.store(server, tool, iteration, output)
+            output = (f"{preview}\n\n[OUTPUT STORED — Reference: {stashed_ref}. "
+                      f"Use local/read_output with ref=\"{stashed_ref}\" to read more.]")
+        output = _with_operator_note(output, verdict)
+        print_tool_result(output, success=True)
+        return ToolResult(success=True, output=output, duration_ms=duration_ms)
     
     # =========================================================================
     # MCP TOOLS - gate checks, backoff, execution
@@ -431,20 +464,21 @@ async def execute_tool_call(
         )
     
     # Gate check
-    allowed, modified_args = gate_tool_call(server, tool, args, state)
+    verdict = gate_tool_call(server, tool, args, state)
     
-    if not allowed:
-        print_tool_denied(display_key, "Denied by gate")
+    if not verdict.allowed:
+        print_tool_denied(display_key, _denial_label(verdict))
         return ToolResult(
             success=False,
             output="",
-            error="Denied by permission gate",
-            was_denied=True
+            error=verdict.denial_text(),
+            was_denied=True,
+            aborted=verdict.aborted,
         )
     
     # Use modified args if gate changed them (e.g., path redirect)
-    if modified_args:
-        args = modified_args
+    if verdict.args:
+        args = verdict.args
     
     # Get the MCP client
     client = mcp_clients.get(server)
@@ -506,6 +540,8 @@ async def execute_tool_call(
             # The reference key must be inline in the returned text or the
             # model has no way to paginate the stashed output.
             output = f"{preview}\n\n[OUTPUT STORED — Reference: {stashed_ref}. Use local/read_output with ref=\"{stashed_ref}\" to read more.]"
+
+        output = _with_operator_note(output, verdict)
 
         # Record in state
         record_tool_call(
@@ -645,6 +681,10 @@ async def execute_tool_calls(
         server = call.get("server", "")
         tool = call.get("tool", "")
         args = call.get("args", {})
+
+        abort_event = getattr(state, "abort_event", None)
+        if abort_event is not None and abort_event.is_set():
+            break       # force pause: don't start anything new
         
         result = await execute_tool_call(
             mcp_clients=mcp_clients,
@@ -657,7 +697,8 @@ async def execute_tool_calls(
         results[i] = result
         
         if result.was_denied:
-            print_warning(f"  🛑 Stopping batch: {server}/{tool} was denied")
+            if not result.aborted:
+                print_warning(f"  🛑 Stopping batch: {server}/{tool} was not run")
             break
         
         if state.step_mode:
@@ -696,7 +737,7 @@ async def execute_tool_calls(
                 error=(
                     f"skipped: batch halted before "
                     f"{call.get('server', '')}/{call.get('tool', '')} executed "
-                    f"(earlier call was denied or step mode paused execution)"
+                    f"(an earlier call was not run, the operator paused, or step mode)"
                 ),
                 duration_ms=0,
                 was_denied=True

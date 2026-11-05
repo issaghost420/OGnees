@@ -7,9 +7,16 @@ gates, logging, and the LLM. This is where OGneeys come to life.
 """
 
 import asyncio
+import concurrent.futures
+import http.client
 import json
 import os
 import re
+import signal
+import socket
+import threading
+import time
+import urllib.parse
 import requests
 import wcwidth
 from collections import Counter
@@ -24,12 +31,17 @@ from .config import (
     MAX_ITERATIONS,
     REQUEST_TIMEOUT,
     DEFAULT_TRUST_TIER,
+    INPUT_HISTORY_FILE,
 )
 from .context import (
     Session,
     SessionState,
+    transition_state,
     queue_user_message,
     drain_queued_messages,
+    post_inbox,
+    drain_inbox,
+    request_force_pause,
     check_context_limits,
     update_token_count,
     inject_state_into_messages,
@@ -43,7 +55,7 @@ from .commands import (
     execute_command,
     CommandResult,
 )
-from .gates import get_tier_name, check_and_enforce_ssh
+from .gates import get_tier_name, get_tier_level, check_and_enforce_ssh
 from .tools import (
     execute_tool_call,
     execute_tool_calls,
@@ -56,7 +68,9 @@ from .tools import (
     READ_ONLY_TOOLS,
 )
 from .mcp import MCPManager, load_mcp, make_native_name, NATIVE_NAME_SEP
-from .session_log import SessionLogger, log_tool_to_global
+from .session_log import SessionLogger, log_tool_to_global, redact_secrets
+from .inputhub import get_hub, strip_ansi
+from .shell_policy import get_policy
 from .startup import startup, shutdown, build_system_prompt
 from .display import (
     print_system,
@@ -216,10 +230,33 @@ class LoopDetector:
         self._count = 0
 
 
-def build_native_tools(mcp: MCPManager) -> list:
-    """OpenAI ``tools`` schemas for MCP tools plus built-in local tools."""
-    schemas = mcp.get_tools_schema()
+def build_native_tools(mcp: MCPManager, state: Optional[Session] = None) -> list:
+    """OpenAI ``tools`` schemas for MCP tools plus built-in local tools.
+
+    Tools/servers the operator disabled (/disable) are left out entirely, so
+    the model never sees them and no tokens are spent describing them.
+    """
+    disabled = set(getattr(state, "disabled_tools", set()) or ()) if state is not None else set()
+
+    def _off(server: str, name: str) -> bool:
+        return server in disabled or f"{server}/{name}" in disabled
+
+    schemas = []
+    for tool in mcp.all_tools:
+        server, name = tool.get("server", ""), tool.get("name", "")
+        if _off(server, name):
+            continue
+        schemas.append({
+            "type": "function",
+            "function": {
+                "name": make_native_name(server, name),
+                "description": tool.get("description", ""),
+                "parameters": tool.get("inputSchema", {"type": "object", "properties": {}}),
+            },
+        })
     for local_tool in get_local_tools():
+        if _off("local", local_tool["name"]):
+            continue
         schemas.append({
             "type": "function",
             "function": {
@@ -324,27 +361,35 @@ def _trim_messages(messages: list, state: Session):
 # DISPLAY WIDTH HELPERS
 # =============================================================================
 
-def visual_width(s: str) -> int:
-    return max(0, wcswidth(s))
+_ANSI_SPLIT_RE = re.compile(r"(\x1b\[[0-9;?]*[ -/]*[@-~])")
 
-# width tracking using wcwidth() per character.
+
+def visual_width(s: str) -> int:
+    return max(0, wcswidth(strip_ansi(s)))
+
+# width tracking using wcwidth() per character; ANSI escapes are zero-width
+# (they used to count as -1 each, which is why the banner box was ragged).
 def pad_to_width(s: str, width: int) -> str:
     cumulative = 0
-    out_chars = []
-    for ch in s:
-        ch_width = wcwidth.wcwidth(ch)
-        if ch_width is None:
-            ch_width = 0
-        if cumulative + ch_width > width:
-            break
-        cumulative += ch_width
-        out_chars.append(ch)
-    result = "".join(out_chars)
-    # Pad with spaces if shorter than width
-    padding = width - cumulative
-    if padding > 0:
-        result += " " * padding
-    return result
+    out = []
+    for part in _ANSI_SPLIT_RE.split(s):
+        if not part:
+            continue
+        if _ANSI_SPLIT_RE.fullmatch(part):
+            out.append(part)
+            continue
+        for ch in part:
+            ch_width = wcwidth.wcwidth(ch)
+            if ch_width is None or ch_width < 0:
+                ch_width = 0
+            if cumulative + ch_width > width:
+                break
+            cumulative += ch_width
+            out.append(ch)
+    result = "".join(out)
+    if cumulative < width:
+        result += " " * (width - cumulative)
+    return result + COLORS.RESET
 
 def row(content: str) -> str:
     return f"│ {pad_to_width(content, INNER_WIDTH - 2)} │"
@@ -353,11 +398,10 @@ def row(content: str) -> str:
 # MID-TURN CONTROL
 # =============================================================================
 #
-# The old `_check_stdin_for_pause` poller (select()+sys.stdin.readline()
-# racing the terminal line discipline and readline) is gone. Mid-turn
-# interruption is handled by KeyboardInterrupt; pause/plan state changes
-# happen between turns through the slash commands and the single
-# SessionState transition point (see context.SessionState).
+# The keyboard is read on the main thread while the agent runs on a worker
+# thread (see interactive_session). /pf calls request_force_pause(), which
+# cancels the in-flight LLM request below, cancels MCP tool calls, and
+# resolves any open approval prompt; race_abort() is the safety net.
 
 # =============================================================================
 # LLM COMMUNICATION
@@ -386,12 +430,127 @@ def get_current_model() -> str:
     except Exception:
         return "unknown"
 
-# freezing the event loop. Made async and offloaded HTTP to thread pool.
+
+class OperatorCancelled(Exception):
+    """The operator force-paused while an LLM request was in flight."""
+
+
+class _InflightRequest:
+    """Handle on one LLM HTTP request so /pf can kill its socket.
+
+    Shutting the socket down unblocks the waiting thread immediately and
+    tells LM Studio the client went away, so it can stop generating.
+    """
+
+    def __init__(self):
+        self.conn = None
+        self.cancelled = False
+        self._lock = threading.Lock()
+
+    def attach(self, conn):
+        with self._lock:
+            self.conn = conn
+            cancelled = self.cancelled
+        if cancelled:
+            self._shutdown()
+
+    def cancel(self):
+        with self._lock:
+            self.cancelled = True
+        self._shutdown()
+
+    def _shutdown(self):
+        conn = self.conn
+        sock = getattr(conn, "sock", None) if conn is not None else None
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+
+_inflight_lock = threading.Lock()
+_inflight_requests: set = set()
+
+# OGNEE_HTTP_CLIENT=requests restores the old (uncancellable) transport.
+_HTTP_CLIENT = os.environ.get("OGNEE_HTTP_CLIENT", "cancellable").strip().lower()
+
+
+def cancel_inflight_llm_requests() -> int:
+    """Abort every LLM request in flight (called by /pf). Returns the count."""
+    with _inflight_lock:
+        reqs = list(_inflight_requests)
+    for r in reqs:
+        r.cancel()
+    return len(reqs)
+
+
+def _post_json_requests(url: str, payload: dict, timeout: float) -> dict:
+    response = _llm_session.post(url, json=payload, timeout=timeout)
+    response.raise_for_status()
+    return response.json()
+
+
+def _post_json_cancellable(url: str, payload: dict, timeout: float, req: _InflightRequest) -> dict:
+    """POST JSON with http.client so the socket can be shut down from /pf.
+
+    Errors are raised as requests exceptions so existing handlers still
+    catch them as "API Error".
+    """
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        return _post_json_requests(url, payload, timeout)
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    path = parts.path or "/"
+    if parts.query:
+        path += "?" + parts.query
+    conn_cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
+    conn = conn_cls(parts.hostname, port, timeout=timeout)
+    body = json.dumps(payload).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Authorization": f"Bearer {LM_STUDIO_TOKEN}",
+    }
+    try:
+        conn.connect()
+        req.attach(conn)
+        if req.cancelled:
+            raise OperatorCancelled()
+        conn.request("POST", path, body=body, headers=headers)
+        resp = conn.getresponse()
+        data = resp.read()
+    except OperatorCancelled:
+        raise
+    except (OSError, http.client.HTTPException) as e:
+        if req.cancelled:
+            raise OperatorCancelled() from None
+        if isinstance(e, TimeoutError):
+            raise requests.exceptions.Timeout(
+                f"LM Studio didn't answer within {timeout}s ({url})") from None
+        raise requests.exceptions.ConnectionError(f"{type(e).__name__}: {e} ({url})") from None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    if req.cancelled:
+        raise OperatorCancelled()
+    if resp.status >= 400:
+        snippet = data[:500].decode("utf-8", "replace")
+        raise requests.exceptions.HTTPError(f"{resp.status} {resp.reason} from {url}: {snippet}")
+    try:
+        return json.loads(data.decode("utf-8"))
+    except ValueError as e:
+        raise ValueError(f"LM Studio returned invalid JSON: {e}") from None
+
+
 async def chat(messages: list, tools: list = None) -> dict:
     """Send chat request to LM Studio (async — does not block the event loop).
 
     When ``tools`` is provided (native tool-calling profile), the schemas are
     sent via the OpenAI ``tools`` parameter with ``tool_choice="auto"``.
+    The request is registered so /pf can cancel it mid-generation.
     """
     payload = {
         "messages": messages,
@@ -405,16 +564,18 @@ async def chat(messages: list, tools: list = None) -> dict:
         payload["tool_choice"] = "auto"
     
     loop = asyncio.get_event_loop()
-    response = await loop.run_in_executor(
-        None,
-        lambda: _llm_session.post(
-            LM_STUDIO_URL,
-            json=payload,
-            timeout=REQUEST_TIMEOUT
-        )
-    )
-    response.raise_for_status()
-    return response.json()
+    if _HTTP_CLIENT == "requests":
+        return await loop.run_in_executor(
+            None, lambda: _post_json_requests(LM_STUDIO_URL, payload, REQUEST_TIMEOUT))
+    req = _InflightRequest()
+    with _inflight_lock:
+        _inflight_requests.add(req)
+    try:
+        return await loop.run_in_executor(
+            None, lambda: _post_json_cancellable(LM_STUDIO_URL, payload, REQUEST_TIMEOUT, req))
+    finally:
+        with _inflight_lock:
+            _inflight_requests.discard(req)
 
 # empty turns. Now checks for API errors first, only catches structural errors.
 def extract_response_text(response: dict) -> str:
@@ -1095,22 +1256,135 @@ PLAN_MODE_MARKER = (
 # AGENT LOOP
 # =============================================================================
 
+class ForcePaused(Exception):
+    """Raised inside the agent loop when the operator force-pauses (/pf)."""
+
+
+async def race_abort(coro, state: Session):
+    """Await *coro*, but give up the moment the operator force-pauses.
+
+    The /pf handler already cancels the HTTP request and MCP calls so they
+    return quickly; this is the safety net for anything that doesn't.
+    """
+    task = asyncio.ensure_future(coro)
+    ev = getattr(state, "abort_event", None)
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=0.1)
+            if done:
+                return task.result()
+            if ev is not None and ev.is_set():
+                task.cancel()
+                await asyncio.wait({task}, timeout=2.0)
+                raise ForcePaused()
+    except OperatorCancelled:
+        raise ForcePaused()
+    except asyncio.CancelledError:
+        task.cancel()
+        raise
+
+
+def _append_assistant(messages: list, text: str):
+    """Append assistant text without creating two assistant turns in a row."""
+    if messages and messages[-1].get("role") == "assistant" and not messages[-1].get("tool_calls"):
+        prev = messages[-1].get("content") or ""
+        messages[-1]["content"] = (prev + "\n\n" + text).strip()
+    else:
+        messages.append({"role": "assistant", "content": text})
+
+
+def _deliver_inbox(messages: list, state: Session, logger: SessionLogger):
+    """Hand anything the operator typed mid-turn to the model."""
+    items = drain_inbox(state)
+    if not items:
+        return
+    text = "\n\n".join(items)
+    content = f"[Mid-turn message from the operator]\n{text}"
+    if messages and messages[-1].get("role") == "user" and isinstance(messages[-1].get("content"), str):
+        messages[-1]["content"] += "\n\n" + content
+    else:
+        messages.append({"role": "user", "content": content})
+    logger.log_user_message(text)
+    print_system(f"  📨 delivered {len(items)} message(s) from you to OGneey")
+
+
+def _park_inbox(state: Session):
+    """Move undelivered mid-turn messages to the paused queue (/resume delivers)."""
+    leftover = drain_inbox(state)
+    for item in leftover:
+        queue_user_message(state, item)
+    return len(leftover)
+
+
+def _gentle_pause_exit(state: Session, logger: SessionLogger):
+    state.resume_pending = True
+    parked = _park_inbox(state)
+    logger.log_event("pause", {"kind": "gentle", "turn": state.turn_count})
+    extra = f" · {parked} message(s) queued" if parked else ""
+    print_system(f"\n⏸  Paused at a turn boundary{extra}. /r resumes · anything you type now is queued for /r")
+
+
+def _force_pause_exit(messages: list, state: Session, logger: SessionLogger,
+                      inflight: Optional[list] = None, text: str = ""):
+    if inflight:
+        names = ", ".join(f"{c.get('server')}/{c.get('tool')}" for c in inflight)
+        note = (f"[Interrupted by the operator (force pause) while running: {names}. "
+                f"Results unknown — some of these may have partly run.]")
+        _append_assistant(messages, ((text or "") + "\n\n" + note).strip())
+    else:
+        _append_assistant(messages, "(Stopped by the operator before I finished responding.)")
+    state.abort_event.clear()
+    state.resume_pending = True
+    parked = _park_inbox(state)
+    if state.mode is not SessionState.PAUSED:
+        transition_state(state, SessionState.PAUSED)
+    logger.log_event("pause", {"kind": "force", "turn": state.turn_count,
+                               "inflight": [f"{c.get('server')}/{c.get('tool')}" for c in (inflight or [])]})
+    extra = f" · {parked} message(s) queued" if parked else ""
+    print_warning(f"\n⏹  Stopped{extra}. Session is paused — /r to resume, or type a message first (delivered on /r).")
+    return True
+
+
+def _show_reasoning(state: Session, logger: SessionLogger, reasoning: str):
+    if not reasoning:
+        return
+    state.last_reasoning = reasoning
+    logger.log_reasoning(state.turn_count, reasoning)
+    mode = getattr(state, "think_mode", "short")
+    if mode == "off":
+        return
+    if mode == "full":
+        body = reasoning.strip().replace("\n", "\n     ")
+        print_dim(f"  💭 Thinking:\n     {body}")
+        return
+    short = reasoning[:300]
+    more = len(reasoning) - len(short)
+    tail = f"… (+{more:,} chars · /think last to expand · /think full to always expand)" if more > 0 else ""
+    print_dim(f"  💭 Thinking: {short}{tail}")
+
+
 async def agent_loop(
     task: str,
     mcp: MCPManager,
     state: Session,
     logger: SessionLogger,
     system_prompt: str,
-    messages: list = None
+    messages: list = None,
+    new_task: bool = True,
 ) -> bool:
     """
     Main agent loop with MCP tool execution.
-    
-    Returns True if task completed successfully, False otherwise.
+
+    Returns True if task completed (or was paused) cleanly, False on error.
+
+    Operator control points (input arrives on another thread while this runs):
+      * top of every iteration: /pf (abort), /p (pause), mid-turn messages
+      * the LLM request and the tool batch are raced against /pf
+      * after tool results are safely in history: /pf, /p
     """
-    
-    # (removed — task header printed by interactive_loop only when needed)
-    
+    if new_task and hasattr(state, "gate_exceptions"):
+        state.gate_exceptions.setdefault("task", set()).clear()
+
     # Initialize messages if not provided
     if messages is None:
         messages = [
@@ -1126,17 +1400,21 @@ async def agent_loop(
                 profile=profile, extra_tools=get_local_tools()
             )
     else:
-        # Append new task
-        messages.append({"role": "user", "content": task})
-    
+        # Append new task (merge if the history already ends on a user turn,
+        # e.g. after a force pause)
+        if messages and messages[-1].get("role") == "user" and isinstance(messages[-1].get("content"), str):
+            messages[-1]["content"] += "\n\n" + task
+        else:
+            messages.append({"role": "user", "content": task})
+
     # Inject custom prompt if any
     if hasattr(state, 'custom_prompt') and state.custom_prompt:
         if "## Additional Instructions" not in messages[0]["content"]:
             messages[0]["content"] += f"\n\n## Additional Instructions\n{state.custom_prompt}"
-    
+
     # Log user message
     logger.log_user_message(task)
-    
+
     # Handle plan mode toggle (tools already in system prompt from session
     # init). The marker is added when plan mode is on AND removed when it is
     # off, so mid-session /plan and /plan-off leave the prompt consistent.
@@ -1149,7 +1427,7 @@ async def agent_loop(
     else:
         if "[TOOLS DISABLED]" not in messages[0]["content"]:
             messages[0]["content"] += "\n\n[TOOLS DISABLED] You are in chat-only mode. Do NOT output any tool calls, JSON blocks, or code blocks with tool invocations. Just respond conversationally.\n"
-    
+
     # ==========================================================================
     # CHAT-ONLY MODE: Single turn when tools fully disabled
     # ==========================================================================
@@ -1157,16 +1435,13 @@ async def agent_loop(
         try:
             print_dim(f"\n--- Chat Mode (1 turn) ---")
             print_ognee_thinking()
-            response = await chat(messages)
-            
+            response = await race_abort(chat(messages), state)
+
             # Extract text and reasoning
             text = extract_response_text(response)
             reasoning = extract_reasoning_content(response)
-            
-            # Show reasoning if present
-            if reasoning:
-                print_dim(f"  💭 Thinking: {reasoning[:300]}{'...' if len(reasoning) > 300 else ''}")
-            
+            _show_reasoning(state, logger, reasoning)
+
             # Update tokens
             usage = response.get("usage", {})
             if usage:
@@ -1176,18 +1451,20 @@ async def agent_loop(
                     api_usage=usage
                 )
                 print_dim(f"  📊 Tokens: {usage.get('total_tokens', '?')}")
-            
+
             state.turn_count += 1
-            
+
             if text:
+                messages.append({"role": "assistant", "content": text})
                 if not _looks_like_tool_json(text):
                     print_ognee_response(text)
                     logger.log_assistant_message(text, usage.get("total_tokens", 0))
             else:
                 print_dim("  (no text response)")
-            
+
             return True
-            
+        except ForcePaused:
+            return _force_pause_exit(messages, state, logger)
         except KeyboardInterrupt:
             print_warning("\n⏸ Interrupted")
             return True
@@ -1196,7 +1473,7 @@ async def agent_loop(
             import traceback
             traceback.print_exc()
             return False
-    
+
     # ==========================================================================
     # AGENTIC MODE: Multi-turn with tool execution
     # ==========================================================================
@@ -1207,21 +1484,22 @@ async def agent_loop(
     profile = detect_tool_profile(state)
     native_mode = profile == "native"
     registry = build_tool_registry(mcp)
-    native_tools = build_native_tools(mcp) if native_mode else None
     loop_detector = LoopDetector()
     loop_notice_sent = False  # deliver the "you're stuck" notice once
+    last_tool_count = None
 
-    if native_mode:
-        print_dim(f"  🔧 Tool profile: native ({len(native_tools)} tools via API)")
-    else:
+    if not native_mode:
         print_dim(f"  🔧 Tool profile: {profile} (text-parsed)")
-    
+
     for iteration in range(MAX_ITERATIONS):
-        # Never run while paused (the interactive loop enforces this too).
+        # ---- operator control points --------------------------------------
+        if state.abort_event.is_set():
+            return _force_pause_exit(messages, state, logger)
         if state.paused:
-            print_system("⏸ Paused after turn. Use /resume to continue.")
+            _gentle_pause_exit(state, logger)
             return True
-        
+        _deliver_inbox(messages, state, logger)
+
         # Check context limits
         can_continue, stop_reason = check_context_limits(state)
         if not can_continue:
@@ -1229,27 +1507,38 @@ async def agent_loop(
             summary = "Session ended due to context limit."
             save_continuation_scroll(state, summary)
             return False
-        
+
         # Inject state if needed (mutates messages[0] in-place — no copy needed)
         if should_inject_state(state):
             inject_state_into_messages(messages, state)
         messages_with_state = messages
-        
+
+        # Native tool schemas are rebuilt every turn so /disable and /enable
+        # take effect immediately (disabled tools are not sent at all).
+        native_tools = build_native_tools(mcp, state) if native_mode else None
+        if native_mode:
+            total = len(mcp.all_tools) + len(get_local_tools())
+            if native_tools is not None and len(native_tools) != last_tool_count:
+                hidden = total - len(native_tools)
+                extra = f" — {hidden} disabled" if hidden > 0 else ""
+                print_dim(f"  🔧 Tool profile: native ({len(native_tools)} of {total} tools via API{extra})"
+                          if hidden > 0 else f"  🔧 Tool profile: native ({len(native_tools)} tools via API)")
+                last_tool_count = len(native_tools)
+
         print_dim(f"\n--- Turn {iteration + 1}/{MAX_ITERATIONS} ---")
-        
+
+        inflight = None
+        text = ""
         try:
             # Call LLM — with native tool schemas when the model profile
             # supports them, otherwise rely on the profiled text format.
             print_ognee_thinking()
-            response = await chat(messages_with_state, tools=native_tools)
+            response = await race_abort(chat(messages_with_state, tools=native_tools), state)
 
             # Extract response text and reasoning
             text = extract_response_text(response)
             reasoning = extract_reasoning_content(response)
-
-            # Show reasoning if present
-            if reasoning:
-                print_dim(f"  💭 Thinking: {reasoning[:300]}{'...' if len(reasoning) > 300 else ''}")
+            _show_reasoning(state, logger, reasoning)
 
             # Update token count
             usage = response.get("usage", {})
@@ -1267,6 +1556,10 @@ async def agent_loop(
                 print_dim(f"  📊 Tokens: {usage.get('total_tokens', '?')}")
 
             state.turn_count += 1
+
+            if state.abort_event.is_set():
+                # The reply landed just as the operator hit /pf: honor the stop.
+                return _force_pause_exit(messages, state, logger)
 
             # Surface completion-cap truncation to the model instead of
             # silently failing to parse a response that was cut mid-JSON.
@@ -1422,10 +1715,11 @@ async def agent_loop(
             # branch) or after a non-empty response. Resetting it here meant the
             # nudge never fired because the flag was always False by check time.
             tool_results = []
-            
+
             queued_write_calls = []
 
             if tool_calls and state.tools_enabled:
+                inflight = tool_calls
                 if state.plan_mode:
                     # PLAN MODE: Execute read-only tools, queue write tools.
                     # tool_results stays aligned 1:1 with tool_calls so
@@ -1437,12 +1731,12 @@ async def agent_loop(
                     read_results = []
                     if read_calls:
                         print_dim(f"  📖 Executing {len(read_calls)} read-only tool(s)...")
-                        read_results = await execute_tool_calls(
+                        read_results = await race_abort(execute_tool_calls(
                             mcp_clients=mcp.servers,
                             tool_calls=read_calls,
                             state=state,
                             iteration=iteration
-                        )
+                        ), state)
 
                         # Log read tool calls
                         for tc, result in zip(read_calls, read_results):
@@ -1477,13 +1771,13 @@ async def agent_loop(
                 else:
                     # NORMAL MODE: Execute all tools
                     state._last_turn_had_tools = True
-                    tool_results = await execute_tool_calls(
+                    tool_results = await race_abort(execute_tool_calls(
                         mcp_clients=mcp.servers,
                         tool_calls=tool_calls,
                         state=state,
                         iteration=iteration
-                    )
-                    
+                    ), state)
+
                     # Log tool calls
                     for tc, result in zip(tool_calls, tool_results):
                         logger.log_tool_call(
@@ -1494,7 +1788,7 @@ async def agent_loop(
                             success=result.success,
                             duration_ms=result.duration_ms
                         )
-                        
+
                         # Global tool log
                         log_tool_to_global(
                             session_id=state.session_id,
@@ -1505,24 +1799,20 @@ async def agent_loop(
                             success=result.success,
                             duration_ms=result.duration_ms
                         )
-            
-            # Check for pause after tool execution
-            if state.paused:
-                print_system("\n⏸ Paused after turn. Use /resume to continue.")
-                return True
-            
+                inflight = None
+
+            # NOTE: there used to be an `if state.paused: return` right here —
+            # it threw away the results of tools that had just run, so the
+            # model never saw them. Pause is now honored AFTER the results are
+            # appended to history (below).
+
             if text:
                 if not _looks_like_tool_json(text):
                     print_ognee_response(text)
                     logger.log_assistant_message(text, usage.get("total_tokens", 0))
             else:
                 print_dim("  (no text response)")
-            
-            # Check for pause again
-            if state.paused:
-                print_system("\n⏸ Paused. Waiting for input...")
-                return True
-            
+
             # Build next message based on what happened
             if tool_calls and tool_results:
                 # Tools were used — feed results back and loop.
@@ -1590,15 +1880,23 @@ async def agent_loop(
                 # Trim conversation to fit token budget
                 _trim_messages(messages, state)
 
+                # Results are safely in history — now honor stop/pause.
+                if state.abort_event.is_set() or any(getattr(r, "aborted", False) for r in tool_results):
+                    state.abort_event.set()
+                    return _force_pause_exit(messages, state, logger)
+                if state.paused:
+                    _gentle_pause_exit(state, logger)
+                    return True
+
                 # Loop continues — model gets tool results and decides next step
             else:
                 # No tool calls — model chose to respond conversationally.
                 # Turn is complete. Record and exit.
                 messages.append({"role": "assistant", "content": text})
-                
+
                 _trim_messages(messages, state)
-                
-                
+
+
                 # FIX: If the model produced empty text after receiving tool results,
                 # it may have stalled instead of summarizing or continuing. Nudge once.
                 if not text and getattr(state, "_last_turn_had_tools", False):
@@ -1610,7 +1908,9 @@ async def agent_loop(
                     _trim_messages(messages, state)
                     continue  # Loop one more time instead of returning
                 return True
-            
+
+        except ForcePaused:
+            return _force_pause_exit(messages, state, logger, inflight=inflight, text=text)
         except requests.exceptions.RequestException as e:
             print_error(f"\n❌ API Error: {e}")
             logger.log_event("error", {"type": "api_error", "message": str(e)})
@@ -1625,7 +1925,7 @@ async def agent_loop(
             traceback.print_exc()
             logger.log_event("error", {"type": "exception", "message": str(e)})
             return False
-    
+
     print_warning(f"\n⚠️ Max iterations ({MAX_ITERATIONS}) reached")
     logger.log_event("max_iterations", {"iterations": MAX_ITERATIONS})
     return False
@@ -1688,36 +1988,157 @@ async def execute_plan_queue(
     return tool_results
 
 
-def _prompt_for_mode(state: Session) -> str:
-    """REPL prompt string reflecting the current SessionState."""
-    if state.mode is SessionState.PAUSED:
-        return f"{COLORS.WARNING}⏸ {COLORS.RESET}"
-    if state.mode is SessionState.PLAN_REVIEW:
-        return f"{COLORS.SYSTEM}📋 {COLORS.RESET}"
-    return f"{COLORS.COMMAND}› {COLORS.RESET}"
+RESUME_NUDGE = (
+    "[The operator resumed the session. Continue the task from where you left off. "
+    "If you're not sure what's next, or you were waiting on something, say so.]"
+)
+
+from .commands import BUSY_REFUSED  # noqa: E402  (single source of truth)
 
 
-async def interactive_loop(
-    mcp: MCPManager,
-    state: Session,
-    logger: SessionLogger,
-    system_prompt: str
-):
+class AgentRunner:
+    """Runs agent work on its own thread with a persistent event loop, so the
+    main thread can keep reading the keyboard (that's what makes /p, /pf,
+    /tier and mid-turn messages work while OGneey is busy)."""
+
+    def __init__(self):
+        self.loop = asyncio.new_event_loop()
+        self.executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=32, thread_name_prefix="ognee-io")
+        self.loop.set_default_executor(self.executor)
+        self._thread = threading.Thread(target=self._run, name="ognee-agent", daemon=True)
+        self._future: Optional[concurrent.futures.Future] = None
+        self._lock = threading.Lock()
+        self.on_idle = None
+
+    def _run(self):
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_forever()
+
+    def start(self):
+        self._thread.start()
+
+    @property
+    def busy(self) -> bool:
+        f = self._future
+        return f is not None and not f.done()
+
+    def submit(self, coro) -> concurrent.futures.Future:
+        with self._lock:
+            if self.busy:
+                coro.close()
+                raise RuntimeError("agent is busy")
+            fut = asyncio.run_coroutine_threadsafe(coro, self.loop)
+            self._future = fut
+        fut.add_done_callback(self._finished)
+        return fut
+
+    def _finished(self, fut):
+        cb = self.on_idle
+        if cb:
+            try:
+                cb(fut)
+            except Exception:
+                pass
+
+    def wait(self, timeout: float = None):
+        f = self._future
+        if f is None:
+            return
+        try:
+            f.result(timeout=timeout)
+        except Exception:
+            pass
+
+    def stop(self):
+        try:
+            self.loop.call_soon_threadsafe(self.loop.stop)
+        except RuntimeError:
+            pass
+        self._thread.join(timeout=3)
+        self.executor.shutdown(wait=False, cancel_futures=True)
+
+
+async def _run_turns(text: str, mcp: MCPManager, state: Session, logger: SessionLogger,
+                     system_prompt: str, messages: list, new_task: bool = True):
+    """One operator request, plus anything typed while it was finishing."""
+    try:
+        task = text
+        fresh = new_task
+        while True:
+            await agent_loop(task=task, mcp=mcp, state=state, logger=logger,
+                             system_prompt=system_prompt, messages=messages, new_task=fresh)
+            fresh = False
+            if state.abort_event.is_set() or state.paused or state.quit_requested:
+                break
+            follow = drain_inbox(state)
+            if not follow:
+                break
+            print_system(f"  📨 delivering {len(follow)} message(s) you typed while OGneey was finishing")
+            task = "[Message from the operator, typed while you were finishing]\n" + "\n\n".join(follow)
+    except Exception as e:
+        print_error(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+async def _run_plan(plan, mcp, state, logger, system_prompt, messages):
+    try:
+        results = await race_abort(execute_plan_queue(plan, mcp, state, logger), state)
+    except ForcePaused:
+        state.abort_event.clear()
+        print_warning("⏹  Plan execution stopped.")
+        return
+    if not results:
+        return
+    summary_lines = [
+        f"{'✓' if r.success else '✗'} {tc['server']}/{tc['tool']}: {(r.output or r.error or '')[:200]}"
+        for tc, r in zip(plan, results)
+    ]
+    narration = ("[PLAN EXECUTED] The queued plan was executed. Results:\n"
+                 + "\n".join(summary_lines) + "\nPlease summarize the outcome for the user.")
+    await _run_turns(narration, mcp, state, logger, system_prompt, messages, new_task=False)
+
+
+def _tool_names(mcp: MCPManager) -> Dict[str, List[str]]:
+    out: Dict[str, List[str]] = {"local": [t["name"] for t in get_local_tools()]}
+    for t in mcp.all_tools:
+        out.setdefault(t.get("server", "?"), []).append(t.get("name", ""))
+    return out
+
+
+def _tool_catalog(mcp: MCPManager) -> Dict[str, List[Dict[str, str]]]:
+    out: Dict[str, List[Dict[str, str]]] = {
+        "local": [{"name": t["name"], "description": t.get("description", "")} for t in get_local_tools()]
+    }
+    for t in mcp.all_tools:
+        out.setdefault(t.get("server", "?"), []).append(
+            {"name": t.get("name", ""), "description": t.get("description", "") or ""})
+    for name in mcp.servers:
+        out.setdefault(name, [])
+    return out
+
+
+def interactive_session(mcp: MCPManager, state: Session, logger: SessionLogger, system_prompt: str):
+    """Interactive REPL. The keyboard stays live while OGneey works.
+
+    Main thread: reads lines, runs slash commands, answers approval prompts.
+    Agent thread: runs the turns. Plain text typed mid-turn is delivered at
+    the next turn boundary; /p pauses at the boundary, /pf (or Ctrl-C) stops
+    immediately.
     """
-    Interactive REPL for agent tasks.
+    from .commands import (execute_command, CommandResult, canonical_command,
+                           command_names, command_arg_choices)
 
-    State machine (see context.SessionState): RUNNING sends input to the
-    agent loop; PAUSED accepts only slash commands and queues other input;
-    PLAN_REVIEW sends input to the agent loop with write tools queued.
-    Slash commands NEVER fall through to the LLM as tasks.
-    """
+    hub = get_hub()
+    runner = AgentRunner()
 
     # Reset the tool output buffer for this session
     reset_output_buffer()
 
     # Track conversation messages
     messages = [{"role": "system", "content": system_prompt}]
-    
+
     # Inject tools into system prompt once at session start. ONE format
     # section, generated from the model's tool profile (native models get
     # their schemas via the API instead of a prompt block).
@@ -1737,12 +2158,121 @@ async def interactive_loop(
     if hasattr(state, 'custom_prompt') and state.custom_prompt:
         messages[0]["content"] += f"\n\n## Additional Instructions\n{state.custom_prompt}"
 
+    # ---- wiring --------------------------------------------------------------
+    state.available_tools = _tool_names(mcp)
+    state.tool_catalog_provider = lambda: _tool_catalog(mcp)
+
+    def _gate_event(ev: Dict[str, Any]):
+        clean = {k: (redact_secrets(v) if isinstance(v, str) else v) for k, v in ev.items()}
+        logger.log_event("gate", clean)
+    state.gate_event_hook = _gate_event
+
+    def _on_force_pause():
+        cancel_inflight_llm_requests()
+        try:
+            mcp.cancel_all_inflight()
+        except Exception:
+            pass
+        hub.cancel_pending("abort")
+    state.force_pause_hooks.append(_on_force_pause)
+
+    def prompt_provider() -> str:
+        if runner.busy:
+            if state.mode is SessionState.PAUSED:
+                return f"{COLORS.WARNING}(pausing at the next boundary · /pf stops now){COLORS.RESET} › "
+            return f"{COLORS.DIM}(working · /p pause · /pf stop){COLORS.RESET} › "
+        if state.mode is SessionState.PAUSED:
+            return f"{COLORS.WARNING}(paused · /r resumes){COLORS.RESET} › "
+        if state.mode is SessionState.PLAN_REVIEW:
+            return f"{COLORS.SYSTEM}(plan){COLORS.RESET} › "
+        return f"{COLORS.COMMAND}›{COLORS.RESET} "
+
+    def _idle(_fut):
+        state.agent_busy = False
+        hub.refresh_prompt()
+    runner.on_idle = _idle
+
+    def start(coro):
+        state.abort_event.clear()
+        state.agent_busy = True
+        runner.submit(coro)
+        hub.refresh_prompt()
+
+    def start_task(text: str, new_task: bool = True):
+        start(_run_turns(text, mcp, state, logger, system_prompt, messages, new_task))
+
+    def run_command_line(line: str) -> str:
+        """Execute a slash command on the main thread; returns its canonical name."""
+        name = canonical_command(line)
+        busy = runner.busy
+        if busy and name in BUSY_REFUSED:
+            print_warning(f"  ⏳ /{name} can't run while OGneey is working — "
+                          f"/p (pause at the boundary) or /pf (stop now) first.")
+            return name
+        result = execute_command(line, state)
+        if result.result == CommandResult.QUIT:
+            state.quit_requested = True
+            if busy or hub.pending() is not None:
+                request_force_pause(state)
+            return "quit"
+        data = result.data or {}
+        if data.get("force_pause"):
+            if busy or hub.pending() is not None:
+                request_force_pause(state)
+            else:
+                print_system("  Nothing is running. (/p pauses an idle session; it's already idle.)")
+        elif "inject_user_message" in data:
+            msg = data["inject_user_message"]
+            if busy:
+                post_inbox(state, msg)
+                print_dim("  📥 queued for the next turn boundary")
+            elif state.mode is SessionState.PAUSED:
+                queue_user_message(state, msg)
+                print_dim("  📥 queued — /r delivers it")
+            else:
+                start_task(msg)
+        elif "execute_plan" in data:
+            start(_run_plan(data["execute_plan"], mcp, state, logger, system_prompt, messages))
+        elif "ssh_command" in data:
+            # /ssh goes through the same gate/approval path as other shell
+            # tools — no bypass.
+            from .ssh import run_ssh_command
+            ssh_data = data["ssh_command"]
+            allowed, _ = check_and_enforce_ssh(ssh_data["host"], ssh_data["command"], state)
+            if allowed:
+                ssh_result = run_ssh_command(ssh_data["host"], ssh_data["command"])
+                if ssh_result.success:
+                    print(ssh_result.stdout)
+                else:
+                    print_error(ssh_result.stderr)
+        elif data.get("resume"):
+            queued = drain_queued_messages(state)
+            continuing = state.resume_pending
+            state.resume_pending = False
+            if busy:
+                pass        # un-paused before the boundary: the turn just keeps going
+            elif queued:
+                for msg in queued:
+                    print_system(f"  📤 Delivering queued message: {msg[:80]}")
+                text = "\n\n".join(queued)
+                if continuing:
+                    text = RESUME_NUDGE + "\n\n" + text
+                start_task(text, new_task=not continuing)
+            elif continuing:
+                start_task(RESUME_NUDGE, new_task=False)
+        hub.refresh_prompt()
+        return name
+
+    hub.commands_provider = command_names
+    hub.args_provider = lambda cmd: command_arg_choices(cmd, state)
+    hub.command_executor = run_command_line
+    hub.start(history_path=INPUT_HISTORY_FILE, prompt_provider=prompt_provider, threaded=True)
+    runner.start()
+
     # Get model info
     model_name = state.model_name
-    tier_display = get_tier_name(state)
-    
+    tier_display = f"{COLORS.SYSTEM}{get_tier_name(state)}{COLORS.RESET} ({state.trust_tier}, tier {get_tier_level(state)})"
     tool_count = f"{len(mcp.all_tools)} MCP + {len(get_local_tools())} local"
-    
     print(f"""
 ╭{"─" * (INNER_WIDTH)}╮
 {row("OGnee Interactive Mode")}
@@ -1751,115 +2281,100 @@ async def interactive_loop(
 {row(f"Trust: {tier_display}")}
 {row(f"Tools: {tool_count}")}
 {row("")}
-{row("Commands: /help /pause /continue /tools-off /status /quit")}
+{row("Type while it works: /p pause · /pf stop now · /tier N · plain text = steer")}
+{row("Commands: /help /status /tools /think /exceptions /policy /quit")}
 ╰{"─" * (INNER_WIDTH)}╯
 """)
-    
-    while True:
-        try:
-            # Show status line periodically
-            if state.turn_count > 0 and state.turn_count % 5 == 0:
+    print_dim(f"  ⌨  input: {hub.describe()}")
+    if hub.note:
+        print_warning(f"  ⚠  {hub.note}")
+    pol = get_policy()
+    pol_src = "built-in defaults" if pol.source == "builtin" else pol.source
+    print_dim(f"  🛡  shell policy: {pol_src} ({len(pol.deny)} deny · {len(pol.confirm)} confirm · "
+              f"{len(pol.allow)} allow · match={pol.match} · default={pol.default})")
+    if pol.errors:
+        print_error(f"  ⚠  shell policy has errors — ALL shell commands are blocked until fixed: {pol.errors[0]}")
+
+    last_ctrl_c = 0.0
+    last_status_turn = 0
+    try:
+        while True:
+            if state.quit_requested:
+                runner.wait(10)
+                break
+            if (not runner.busy and state.turn_count >= last_status_turn + 5):
+                last_status_turn = state.turn_count - (state.turn_count % 5)
                 print_status_line(state.to_status())
+            try:
+                line = hub.read_line()
+            except KeyboardInterrupt:
+                print()
+                if hub.pending() is not None or runner.busy:
+                    print_warning("  ⏹  Ctrl-C — stopping the current turn (same as /pf)")
+                    request_force_pause(state)
+                    continue
+                now = time.monotonic()
+                if now - last_ctrl_c < 2.0:
+                    break
+                last_ctrl_c = now
+                print_dim("  (Ctrl-C again within 2s — or /q — to quit)")
+                continue
+            except EOFError:
+                print()
+                if runner.busy:
+                    request_force_pause(state)
+                    runner.wait(10)
+                break
 
-            # Get input — prompt reflects the session state. read_input uses
-            # prompt_toolkit (with a readline-safe fallback) so ANSI colors in
-            # the prompt don't corrupt line wrapping.
-            user_input = read_input(_prompt_for_mode(state)).strip()
-            print()  # move off the input line before printing output
+            if hub.pending() is not None:
+                hub.deliver(line)
+                continue
 
-            if not user_input:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if hub.recently_resolved() and hub.looks_like_gate_answer(stripped):
+                print_dim("  (that approval was already resolved — ignored)")
                 continue
 
             # ---- Slash commands: handled here, NEVER sent to the LLM ----
-            if is_command(user_input):
-                result = execute_command(user_input, state)
-
-                if result.result == CommandResult.QUIT:
-                    break
-
-                data = result.data or {}
-                if "inject_user_message" in data:
-                    # /continue, /recap: inject a message as the next task
-                    user_input = data["inject_user_message"]
-                elif "execute_plan" in data:
-                    plan = data["execute_plan"]
-                    results = await execute_plan_queue(plan, mcp, state, logger)
-                    # Optional LLM narration: feed a compact result summary
-                    # back so the model can tell the user what happened.
-                    if results:
-                        summary_lines = [
-                            f"{'✓' if r.success else '✗'} "
-                            f"{tc['server']}/{tc['tool']}: "
-                            f"{(r.output or r.error or '')[:200]}"
-                            for tc, r in zip(data["execute_plan"], results)
-                        ]
-                        user_input = (
-                            "[PLAN EXECUTED] The queued plan was executed. Results:\n"
-                            + "\n".join(summary_lines)
-                            + "\nPlease summarize the outcome for the user."
-                        )
-                    else:
-                        continue
-                elif "ssh_command" in data:
-                    # /ssh goes through the same gate/approval path as other
-                    # shell tools — no bypass.
-                    from .ssh import run_ssh_command
-                    ssh_data = data["ssh_command"]
-                    allowed, _ = check_and_enforce_ssh(
-                        ssh_data["host"], ssh_data["command"], state
-                    )
-                    if not allowed:
-                        continue
-                    ssh_result = run_ssh_command(ssh_data["host"], ssh_data["command"])
-                    if ssh_result.success:
-                        print(ssh_result.stdout)
-                    else:
-                        print_error(ssh_result.stderr)
-                    continue
-                elif data.get("resume"):
-                    # /resume: deliver messages queued while paused — these
-                    # become the next task. No queued messages => no task.
-                    queued = drain_queued_messages(state)
-                    if not queued:
-                        continue
-                    for msg in queued:
-                        print_system(f"  📤 Delivering queued message: {msg[:80]}")
-                    user_input = "\n".join(queued)
-                else:
-                    continue
-            else:
-                # ---- Regular input ----
-                if state.mode is SessionState.PAUSED:
-                    depth = queue_user_message(state, user_input)
-                    print_system(
-                        f"  📥 Paused — message queued ({depth} pending). "
-                        f"It will be delivered on /resume."
-                    )
-                    continue
-
-            # Safety: never enter the agent loop while paused.
-            if state.mode is SessionState.PAUSED:
+            if is_command(stripped):
+                run_command_line(stripped)
                 continue
 
-            # Run the agent loop on the (possibly injected/queued) task
-            await agent_loop(
-                task=user_input,
-                mcp=mcp,
-                state=state,
-                logger=logger,
-                system_prompt=system_prompt,
-                messages=messages
-            )
+            # ---- Regular input ----
+            if runner.busy:
+                depth = post_inbox(state, stripped)
+                print_system(f"  📥 got it — OGneey sees this at the next turn boundary ({depth} waiting)")
+                continue
+            if state.mode is SessionState.PAUSED:
+                depth = queue_user_message(state, stripped)
+                print_system(
+                    f"  📥 Paused — message queued ({depth} pending). "
+                    f"It will be delivered on /resume."
+                )
+                continue
 
-        except (KeyboardInterrupt, EOFError):
-            print("\n")
-            break
-        except Exception as e:
-            print_error(f"Error: {e}")
-            import traceback
-            traceback.print_exc()
+            print()  # move off the input line before printing output
+            start_task(stripped)
+    finally:
+        # From here on we're leaving: a mashed Ctrl-C must not interrupt the
+        # cleanup (it used to be able to skip stopping MCP servers).
+        _ignore_sigint()
+        if runner.busy:
+            request_force_pause(state)
+            runner.wait(10)
+        runner.stop()
+        hub.stop()
 
-    return
+
+def _ignore_sigint():
+    """Ignore Ctrl-C for the rest of the process (used only while exiting)."""
+    if threading.current_thread() is threading.main_thread():
+        try:
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+        except (ValueError, OSError):
+            pass
 
 # =============================================================================
 # ONE-SHOT MODE
@@ -1899,16 +2414,16 @@ def run_interactive(
     # Detect model if not specified
     if not model_name:
         model_name = get_current_model()
-    
+
     # Load MCP
     mcp = MCPManager(config_path)
     if not mcp.load_config():
         print_error("Failed to load MCP config")
         return
-    
+
     if mcp.start_all() == 0:
         print_warning("No MCP servers started. Continuing with local tools only.")
-    
+
     try:
         # Startup sequence
         state, logger, system_prompt = startup(
@@ -1917,13 +2432,15 @@ def run_interactive(
         )
 
         try:
-            # Run interactive loop
-            asyncio.run(interactive_loop(mcp, state, logger, system_prompt))
+            # Run interactive loop (keyboard on this thread, agent on a worker)
+            interactive_session(mcp, state, logger, system_prompt)
         finally:
             # Always finalize logs/close fds, even on crash
+            _ignore_sigint()
             shutdown(state, logger, reason="user_exit")
 
     finally:
+        _ignore_sigint()
         mcp.stop_all()
 
 def run_one_shot(
@@ -1938,16 +2455,18 @@ def run_one_shot(
     # Detect model if not specified
     if not model_name:
         model_name = get_current_model()
-    
+
     # Load MCP
     mcp = MCPManager(config_path)
     if not mcp.load_config():
         print_error("Failed to load MCP config")
         return False
-    
+
     if mcp.start_all() == 0:
         print_warning("No MCP servers started. Continuing with local tools only.")
-    
+
+    success = False
+    hub = get_hub()
     try:
         # Startup sequence
         state, logger, system_prompt = startup(
@@ -1955,6 +2474,8 @@ def run_one_shot(
             trust_level=trust_level,
             quiet=True
         )
+        # Line editing for approval prompts; no worker thread in one-shot mode.
+        hub.start(history_path=INPUT_HISTORY_FILE, threaded=False)
 
         try:
             # Run task
@@ -1966,4 +2487,5 @@ def run_one_shot(
         return success
 
     finally:
+        hub.stop()
         mcp.stop_all()

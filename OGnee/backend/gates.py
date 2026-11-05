@@ -2,15 +2,21 @@
 """
 gates.py - Approval prompts and permission checks
 
-The safety layer. Catches writes, sudo, rm, multi-file ops.
-Turns OSeemies into OGreenies through demonstrated competence.
+The safety layer. Shell commands are decided by the shell policy file
+(shell-policy.json, Zed-style allow/confirm/deny — see shell_policy.py);
+file, move, network and SSH calls by the trust tier. Anything that needs a
+human goes through the 1-7 approval menu, and whatever the operator types
+there (notes, reasons, messages) reaches the model.
 """
 
+import copy
+import json
 import os
 import re
+import shutil
 import unicodedata  # FIX 2: Unicode normalization for interpreter bypass detection
 from enum import Enum, auto
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, Tuple
 from pathlib import Path
 
@@ -33,9 +39,18 @@ from .display import (
     print_error,
     print_success,
     print_system,
+    print_dim,
     prompt_approval,
     prompt_choice,
     COLORS,
+)
+from .inputhub import get_hub
+from .shell_policy import (
+    evaluate as policy_evaluate,
+    get_policy,
+    ALLOW as P_ALLOW,
+    CONFIRM as P_CONFIRM,
+    DENY as P_DENY,
 )
 
 
@@ -236,6 +251,7 @@ def _expand_tilde_path(path: str) -> str:
     return os.path.expanduser(path)
 
 
+
 # =============================================================================
 # GATE RESULTS
 # =============================================================================
@@ -248,33 +264,78 @@ class GateResult(Enum):
     PROMPT = auto()             # Ask user for approval
     MODIFY = auto()             # Allow with modifications
 
+
 @dataclass
 class GateDecision:
     """Decision from a gate check."""
     result: GateResult
     reason: str
-    redirect_path: Optional[str] = None     # For REDIRECT
+    redirect_path: Optional[str] = None     # For REDIRECT / shadow-staged PROMPT
     modified_command: Optional[str] = None  # For MODIFY
-    prompt_options: Optional[Dict] = None   # For PROMPT
+    prompt_options: Optional[Dict] = None   # legacy; the approval menu ignores it
+    # --- approval menu ---
+    title: str = ""                 # e.g. "shell/execute_command"
+    detail: str = ""                # the thing being approved — always shown in full
+    allow_label: str = "allow"
+    warning: str = ""               # e.g. "runs for REAL — not staged to shadow"
+    # (key, label) pairs; options 6/7 add these as task/session exceptions
+    exception_keys: List[Tuple[str, str]] = field(default_factory=list)
+
+
+@dataclass
+class GateVerdict:
+    """What actually happens to a tool call after gating (and the operator).
+
+    ``note`` / ``reason`` / ``message`` carry the operator's words back to the
+    model so nothing typed at an approval prompt is ever lost.
+    """
+    allowed: bool
+    args: Optional[Dict[str, Any]] = None
+    redirect: Optional[str] = None
+    note: str = ""          # [2] allow + note  (also text after [1]/[6]/[7])
+    reason: str = ""        # [4] deny + reason, or the gate's own reason
+    message: str = ""       # [5] say something instead
+    aborted: bool = False   # /pf, Ctrl-C or /quit at the prompt
+    paused: bool = False    # /p at the prompt
+    regate: bool = False    # a slash command changed settings: re-check the call
+    by_operator: bool = False
+    auto: str = ""          # label of the exception that auto-approved it
+
+    def denial_text(self) -> str:
+        """Text the model sees when the call did not run."""
+        if self.aborted:
+            return ("Not executed — the operator force-paused the session (/pf). "
+                    "Stop here and wait for the operator.")
+        if self.paused:
+            return ("Not executed — the operator paused the session (/p). Stop at this "
+                    "point and wait; you'll be resumed with further instructions.")
+        if self.message:
+            return ("Not executed yet — the operator answered this approval prompt with a "
+                    f"message instead: \"{self.message}\". Take it into account. You may "
+                    "re-issue this call (or a different one) if it still makes sense.")
+        if self.by_operator:
+            if self.reason:
+                return f"Denied by the operator. Reason: {self.reason}"
+            return "Denied by the operator."
+        return (f"Blocked by the permission gate: {self.reason}. Don't retry the same call; "
+                "pick another approach or ask the operator.") if self.reason else \
+            "Blocked by the permission gate."
+
 
 # =============================================================================
 # TRUST LEVEL HELPERS
 # =============================================================================
 
 def get_tier_name(state: Session) -> str:
-    """Get display name based on trust level."""
+    """Display name based on trust level (no ANSI — callers color it)."""
     tier_name = state.trust_tier.lower()
-    
-    if tier_name == "probation":
-        return f"{COLORS.WARNING}OGreenie{COLORS.RESET}"
-    elif tier_name == "supervised":
-        return f"{COLORS.SYSTEM}OSeemie{COLORS.RESET}"
-    elif tier_name == "trusted":
-        return f"{COLORS.SUCCESS}OGneey{COLORS.RESET}"
-    elif tier_name == "autonomous":
-        return f"{COLORS.SUCCESS}OFreeney 🌟{COLORS.RESET}"
-    else:
-        return f"OGneey"
+    return {
+        "probation": "OGreenie",
+        "supervised": "OSeemie",
+        "trusted": "OGneey",
+        "autonomous": "OFreeney",
+    }.get(tier_name, "OGneey")
+
 
 def get_tier_level(state: Session) -> int:
     """Get numeric tier level from state."""
@@ -284,166 +345,72 @@ def get_tier_level(state: Session) -> int:
             return level
     return 0
 
+
 def get_tier_config(state: Session):
     """Get TrustTier config for current state."""
     level = get_tier_level(state)
     return TIERS.get(level, TIERS[0])
+
 
 # =============================================================================
 # COMMAND GATES
 # =============================================================================
 
 def check_banned_command(command: str) -> GateDecision:
-    """Check if command is permanently banned."""
-    # FIX 1 + FIX 2: Normalize Unicode and strip before matching.
+    """Check if command is permanently banned (catastrophic patterns)."""
     command_normalized = _normalize_command(command).lower().strip()
-    
-    # FIX 1: Use pre-compiled boundary-aware regex patterns instead of
-    # substring matching (`banned.lower() in command_lower`).
-    # The old code would match "echo 'rm -rf / is bad'" because
-    # "rm -rf /" is a literal substring of the quoted text.
-    # The new patterns use (?<!\w) and (?!\w) boundaries to ensure
-    # banned commands are matched as whole tokens, not substrings.
     for pattern in _BANNED_PATTERNS:
         if pattern.search(command_normalized):
             return GateDecision(
                 result=GateResult.DENY,
-                reason="Command contains banned pattern"
+                reason="command contains a permanently banned pattern"
             )
-    
-    # FIX 5: Check fork bomb with regex that tolerates arbitrary whitespace.
-    # Pattern: : ( ) { : | : & } ; : — each token can be space/tab separated.
-    # The old code used an exact string match for ":(){:|:&};:" which was
-    # trivially bypassed by adding spaces: ": ( ) { : | : & } ; :"
     if FORK_BOMB_RE.search(command_normalized):
-        return GateDecision(
-            result=GateResult.DENY,
-            reason="Fork bomb pattern detected"
-        )
-    
+        return GateDecision(result=GateResult.DENY, reason="fork bomb pattern detected")
     return GateDecision(result=GateResult.ALLOW, reason="")
+
 
 def check_rm_command(command: str, state: Session) -> GateDecision:
-    """Check for rm/delete commands - ALWAYS denied."""
-    # FIX 2: Normalize Unicode to catch homoglyph evasion.
+    """Legacy helper (the shell policy file now decides rm). Kept for callers."""
     command_normalized = _normalize_command(command).lower()
-    
     for rm_re in _RM_PATTERNS_RE:
         if rm_re.search(command_normalized):
-            return GateDecision(
-                result=GateResult.DENY,
-                reason="rm/delete commands are permanently banned. "
-                       "No OGneey gets rm privileges. Ever. "
-                       "Pattern matched"
-            )
-    
+            return GateDecision(result=GateResult.DENY,
+                                reason="rm/delete commands are banned")
     return GateDecision(result=GateResult.ALLOW, reason="")
 
-def check_sudo_command(command: str, state: Session) -> GateDecision:
-    """Check for sudo/privilege escalation."""
-    command_normalized = _normalize_command(command).lower()
-    tier = get_tier_config(state)
-    
-    #   - \bsudo\b       : matches "sudo" as a word
-    #   - \bsudoedit\b   : matches "sudoedit" (the old bypass)
-    #   - \bdoas\b       : matches "doas" privilege escalation
-    #   - \bpkexec\b     : matches "pkexec"
-    #   - \bsu\s+-c\b   : matches "su -c" with any whitespace
-    #   - \bsu\s+root\b : matches "su root" with any whitespace
-    for pattern_re in SUDO_PATTERNS_RE:
-        if pattern_re.search(command_normalized):
-            if tier.can_sudo:
-                # Tier 3 can sudo but we still log it
-                print_warning(f"  ⚡ sudo permitted (tier: {state.trust_tier})")
-                return GateDecision(result=GateResult.ALLOW, reason="Tier permits sudo")
-            else:
-                # Need approval
-                return GateDecision(
-                    result=GateResult.PROMPT,
-                    reason=f"sudo requires approval (current tier: {state.trust_tier})",
-                    prompt_options={
-                        "1": "Allow this once",
-                        "2": "Deny",
-                        "3": "Explain to OGneey why this needs sudo",
-                    }
-                )
-    
-    return GateDecision(result=GateResult.ALLOW, reason="")
 
 def gate_shell_command(command: str, state: Session) -> GateDecision:
-    """Main gate for shell commands."""
-    
-    # Check banned first - no exceptions
+    """Gate for shell commands — resolved by the shell policy (shell-policy.json).
+
+    Zed's order: built-in rules, then deny-any, confirm-any, allow-all, default.
+    See shell_policy.py for the details.
+    """
     decision = check_banned_command(command)
     if decision.result == GateResult.DENY:
         return decision
-    
-    # Check rm - NEVER allowed
-    decision = check_rm_command(command, state)
-    if decision.result == GateResult.DENY:
-        return decision
-    
-    # Check sudo
-    decision = check_sudo_command(command, state)
-    if decision.result != GateResult.ALLOW:
-        return decision
-    
-    # Check for writes via shell (redirects, sed -i, tee, patch, etc.)
+
     tier = get_tier_config(state)
-    if not tier.can_write_direct:
-        write_patterns = [
-            (r'[^2]?>\s*\S', 'output redirect'),               # > or >> to file
-            (r'\btee\s+', 'tee write'),                         # tee to file
-            (r'\bsed\s+.*-i', 'sed in-place edit'),             # sed -i
-            (r'\bpatch\b', 'patch apply'),                      # patch
-            (r'\bdd\s+', 'dd write'),                           # dd write
-            (r'\bcp\s+', 'cp copy'),                            # cp (creates files)
-            (r'\bmv\s+', 'mv move'),                            # mv (modifies filesystem)
-            (r'\bchmod\b', 'chmod'),                            # chmod
-            (r'\bchown\b', 'chown'),                            # chown
-            (r'\bmkdir\b', 'mkdir'),                            # mkdir
-            (r'\btouch\b', 'touch'),                            # touch
-            (r'\bln\s+', 'symlink'),                            # ln
-            (r'\bgit\s+push', 'git push'),                      # git push
-            (r'\bgit\s+commit', 'git commit'),                  # git commit
-            (r'\bnixos-rebuild', 'nixos-rebuild'),              # nixos-rebuild
-            (r'\bsystemctl\s+(start|stop|restart|enable|disable)', 'systemctl'),
-        ]
-        
-        # FIX 2: Normalize Unicode to catch homoglyph evasion.
-        command_str = _normalize_command(command).lower()
-        for pattern, desc in write_patterns:
-            if re.search(pattern, command_str):
-                cmd_preview = command[:100] + ("..." if len(command) > 100 else "")
-                return GateDecision(
-                    result=GateResult.PROMPT,
-                    reason=f"Shell command would modify the filesystem ({desc})",
-                    prompt_options={
-                        "1": f"Allow: {cmd_preview}",
-                        "2": "Deny",
-                    }
-                )
-        
-        # FIX 2: Check interpreter-based file-write bypasses.
-        # Language interpreters (python, node, ruby, perl, sqlite3, vim,
-        # emacs, ed) can write files without using shell redirections or
-        # standard filesystem-modifying commands, completely bypassing
-        # the regex patterns above. Unicode NFKC normalization is applied
-        # upstream in command_str to defeat homoglyph attacks.
-        for interp_re, interp_desc in _INTERPRETER_WRITE_PATTERNS:
-            if interp_re.search(command_str):
-                cmd_preview = command[:100] + ("..." if len(command) > 100 else "")
-                return GateDecision(
-                    result=GateResult.PROMPT,
-                    reason=f"Shell command would modify the filesystem ({interp_desc})",
-                    prompt_options={
-                        "1": f"Allow: {cmd_preview}",
-                        "2": "Deny",
-                    }
-                )
-    
-    # All clear
-    return GateDecision(result=GateResult.ALLOW, reason="Command permitted")
+    pd = policy_evaluate(command, get_tier_level(state), get_policy())
+
+    if pd.result == P_DENY:
+        return GateDecision(result=GateResult.DENY, reason=pd.reason, title="shell")
+    if pd.result == P_ALLOW:
+        return GateDecision(result=GateResult.ALLOW, reason=pd.reason, title="shell")
+
+    warning = ""
+    if pd.writes and not tier.can_write_direct:
+        warning = "this runs for REAL — shell commands are not staged to shadow"
+    return GateDecision(
+        result=GateResult.PROMPT,
+        reason=pd.reason,
+        title="shell",
+        detail=command,
+        allow_label="allow — run it",
+        warning=warning,
+        exception_keys=list(pd.exception_keys),
+    )
+
 
 # =============================================================================
 # FILE ACCESS GATES
@@ -451,275 +418,402 @@ def gate_shell_command(command: str, state: Session) -> GateDecision:
 
 def gate_file_read(path: str, state: Session) -> GateDecision:
     """Gate for file read operations."""
-    
-    # FIX 6: Expand tilde before validation to ensure ~/ paths are
-    # properly resolved and matched against exclusion lists.
-    # Path.resolve() does NOT expand ~ — it remains a literal tilde.
     path = _expand_tilde_path(path)
-    
-    # Check if path is excluded (Documents, Downloads, Trash, etc)
     if is_path_excluded(path):
-        return GateDecision(
-            result=GateResult.DENY,
-            reason=f"Path is in exclusion list (privacy): {path}"
-        )
-    
-    # Check if we can access at all
+        return GateDecision(result=GateResult.DENY,
+                            reason=f"path is in the privacy exclusion list: {path}")
     if not can_access_path(path):
-        return GateDecision(
-            result=GateResult.DENY,
-            reason=f"Path is outside allowed directories: {path}"
-        )
-    
-    return GateDecision(result=GateResult.ALLOW, reason="Read permitted")
+        return GateDecision(result=GateResult.DENY,
+                            reason=f"path is outside the allowed directories: {path}")
+    return GateDecision(result=GateResult.ALLOW, reason="read permitted")
+
+
+def _parent_key(path: str) -> Tuple[str, str]:
+    parent = str(Path(path).expanduser().resolve().parent)
+    return parent, parent.replace(str(Path.home()), "~", 1)
+
 
 def gate_file_write(path: str, state: Session, content_preview: str = "") -> GateDecision:
     """Gate for file write operations."""
     tier = get_tier_config(state)
-    
-    # FIX 6: Expand tilde before validation.
     path = _expand_tilde_path(path)
 
-    # Writes targeting the shadow staging area itself are ALWAYS allowed:
-    # the file is already staged for review. Re-redirecting it through
-    # get_shadow_path() is what produced the doubled
-    # "shadow/home/.../shadow/home/..." paths.
+    # Writes into the shadow staging area itself are always allowed.
     if Path(path).resolve().is_relative_to(SHADOW_ROOT):
-        return GateDecision(result=GateResult.ALLOW, reason="Shadow staging area")
+        return GateDecision(result=GateResult.ALLOW, reason="shadow staging area")
 
-    # Check exclusions first
     if is_path_excluded(path):
-        return GateDecision(
-            result=GateResult.DENY,
-            reason=f"Path is in exclusion list: {path}"
-        )
-    
-    # If path is in writable list, check tier
-    if is_path_writable(path):
-        if tier.can_write_direct:
-            return GateDecision(result=GateResult.ALLOW, reason="Direct write permitted")
-        elif tier.can_write_shadow:
-            # Prompt before writing — let user see what's happening
-            shadow = get_shadow_path(path)
-            return GateDecision(
-                result=GateResult.PROMPT,
-                reason=f"Write to {path} (will go to shadow)",
-                redirect_path=str(shadow),
-                prompt_options={
-                    "1": "Allow (writes to shadow)",
-                    "2": "Deny",
-                }
-            )
-        else:
-            # OSeemie tier - needs approval
-            return GateDecision(
-                result=GateResult.PROMPT,
-                reason=f"Write requires approval (tier: {state.trust_tier})",
-                prompt_options={
-                    "1": "Allow write to shadow",
-                    "2": "Deny",
-                    "3": "Show me what it wants to write",
-                }
-            )
-    
-    # If path is read-only, always redirect to shadow
-    if is_path_read_only(path):
-        if tier.can_write_shadow:
-            shadow = get_shadow_path(path)
-            return GateDecision(
-                result=GateResult.PROMPT,
-                reason=f"Write to read-only path {path} (will go to shadow)",
-                redirect_path=str(shadow),
-                prompt_options={
-                    "1": "Allow (writes to shadow)",
-                    "2": "Deny",
-                }
-            )
-        else:
-            return GateDecision(
-                result=GateResult.PROMPT,
-                reason=f"OSeemie wants to modify read-only file",
-                prompt_options={
-                    "1": "Allow to shadow",
-                    "2": "Deny",
-                    "3": "Explain the situation",
-                }
-            )
-    
-    # Path not in any allowed list
-    return GateDecision(
-        result=GateResult.DENY,
-        reason=f"Path not in allowed directories: {path}"
-    )
+        return GateDecision(result=GateResult.DENY,
+                            reason=f"path is in the privacy exclusion list: {path}")
 
-def gate_multi_file_write(paths: List[str], state: Session) -> GateDecision:
-    """Gate for operations touching multiple files."""
-    tier = get_tier_config(state)
-    
-    if len(paths) < 3:
-        # Less than 3 files, handle individually
-        return GateDecision(result=GateResult.ALLOW, reason="Small batch, proceed")
-    
-    # 3+ files - require review
-    if tier.level >= 2:
-        # Trusted+ can batch write
-        print_warning(f"  📦 Batch write: {len(paths)} files")
-        return GateDecision(result=GateResult.ALLOW, reason="Tier permits batch")
-    
-    # Lower tiers need approval
-    return GateDecision(
-        result=GateResult.PROMPT,
-        reason=f"Batch write of {len(paths)} files requires approval",
-        prompt_options={
-            "1": f"Allow all {len(paths)} files",
-            "2": "Review files one by one",
-            "3": "Deny all",
-        }
-    )
+    parent, parent_disp = _parent_key(path)
+    keys = [(f"write:{parent}", f"writes in {parent_disp}/")]
+    detail = path + (f"\n\n{content_preview}" if content_preview else "")
 
-# =============================================================================
-# NETWORK GATES
-# =============================================================================
-
-def gate_network_request(url: str, state: Session, first_request: bool = False) -> GateDecision:
-    """Gate for network requests."""
-    tier = get_tier_config(state)
-    
-    if tier.can_network:
-        return GateDecision(result=GateResult.ALLOW, reason="Network permitted")
-    
-    if first_request:
-        # First network request of session needs approval
+    if is_path_writable(path) or is_path_read_only(path):
+        if tier.can_write_direct and is_path_writable(path):
+            return GateDecision(result=GateResult.ALLOW, reason="direct write permitted")
+        shadow = get_shadow_path(path)
+        where = "writable" if is_path_writable(path) else "read-only"
         return GateDecision(
             result=GateResult.PROMPT,
-            reason=f"First network request requires approval",
-            prompt_options={
-                "1": "Allow network access for this session",
-                "2": "Allow this request only",
-                "3": "Deny network access",
-            }
+            reason=f"{state.trust_tier} tier stages writes ({where} path)",
+            redirect_path=str(shadow),
+            title="write file",
+            detail=detail,
+            allow_label="allow (stage to shadow)",
+            warning=(f"will be written to shadow: {shadow} — type /tier 2 here to write it "
+                     f"for real" if not tier.can_write_direct else
+                     f"read-only path: will be written to shadow: {shadow}"),
+            exception_keys=keys,
         )
-    
-    return GateDecision(result=GateResult.DENY, reason="Network access not permitted")
+
+    return GateDecision(result=GateResult.DENY,
+                        reason=f"path is not in the allowed directories: {path}")
+
+
+def gate_file_move(src: str, dst: str, state: Session) -> GateDecision:
+    """Gate for move/rename.
+
+    A move cannot be staged: rewriting only the destination into shadow (the
+    old behavior) really MOVED the real file into the shadow tree and
+    reported success. Moves are now direct-or-prompt, never redirected.
+    """
+    tier = get_tier_config(state)
+    src = _expand_tilde_path(src or "")
+    dst = _expand_tilde_path(dst or "")
+    for p in (src, dst):
+        if p and is_path_excluded(p):
+            return GateDecision(result=GateResult.DENY,
+                                reason=f"path is in the privacy exclusion list: {p}")
+        if p and not can_access_path(p):
+            return GateDecision(result=GateResult.DENY,
+                                reason=f"path is outside the allowed directories: {p}")
+    if dst and Path(dst).resolve().is_relative_to(SHADOW_ROOT):
+        return GateDecision(result=GateResult.ALLOW, reason="move into the shadow staging area")
+    if tier.can_write_direct and (not dst or is_path_writable(dst)) and (not src or is_path_writable(src)):
+        return GateDecision(result=GateResult.ALLOW, reason="direct move permitted")
+    parent, parent_disp = _parent_key(dst or src)
+    return GateDecision(
+        result=GateResult.PROMPT,
+        reason=f"moves can't be staged to shadow at {state.trust_tier} tier",
+        title="move file",
+        detail=f"{src}\n  → {dst}",
+        allow_label="allow — do the REAL move",
+        warning="this moves the actual file (not a staged copy)",
+        exception_keys=[(f"move:{parent}", f"moves into {parent_disp}/")],
+    )
+
+
+def gate_multi_file_write(paths: List[str], state: Session) -> GateDecision:
+    """Gate for operations touching multiple files (kept for compatibility)."""
+    tier = get_tier_config(state)
+    if len(paths) < 3 or tier.level >= 2:
+        return GateDecision(result=GateResult.ALLOW, reason="batch permitted")
+    return GateDecision(result=GateResult.PROMPT,
+                        reason=f"batch write of {len(paths)} files",
+                        title="batch write", detail="\n".join(paths),
+                        exception_keys=[("batch:write", "batch writes")])
+
+
+# =============================================================================
+# NETWORK / SSH GATES
+# =============================================================================
+
+def gate_network_request(url: str, state: Session, first_request: bool = False,
+                         tool_key: str = "") -> GateDecision:
+    """Gate for network requests. Below tier 2 it asks (was: hard deny)."""
+    tier = get_tier_config(state)
+    if tier.can_network:
+        return GateDecision(result=GateResult.ALLOW, reason="network permitted")
+    key = tool_key or url
+    return GateDecision(
+        result=GateResult.PROMPT,
+        reason=f"network access isn't granted at {state.trust_tier} tier",
+        title=f"network · {key}",
+        detail=url,
+        exception_keys=[(f"net:{key}", f"`{key}`")],
+    )
+
 
 def gate_ssh_command(host: str, command: str, state: Session) -> GateDecision:
-    """Gate for SSH commands to other hosts."""
+    """Gate for SSH commands to other hosts (policy applies to the remote command)."""
     tier = get_tier_config(state)
-    
-    # First check the command itself for banned patterns
     cmd_gate = gate_shell_command(command, state)
     if cmd_gate.result == GateResult.DENY:
         return cmd_gate
-    
-    if tier.can_ssh:
-        print_system(f"  🔗 SSH to {host}: {command[:50]}...")
+    needs_ssh_ok = not tier.can_ssh
+    if not needs_ssh_ok and cmd_gate.result == GateResult.ALLOW:
+        print_system(f"  🔗 SSH to {host}: {command[:60]}")
         return GateDecision(result=GateResult.ALLOW, reason="SSH permitted")
-    
+    reasons = []
+    keys: List[Tuple[str, str]] = []
+    if needs_ssh_ok:
+        reasons.append(f"SSH isn't granted at {state.trust_tier} tier")
+        keys.append((f"ssh:{host}", f"SSH to {host}"))
+    if cmd_gate.result == GateResult.PROMPT:
+        reasons.append(cmd_gate.reason)
+        keys.extend(cmd_gate.exception_keys)
     return GateDecision(
         result=GateResult.PROMPT,
-        reason=f"SSH to {host} requires approval",
-        prompt_options={
-            "1": f"Allow SSH to {host}",
-            "2": "Deny",
-            "3": "See full command first",
-        }
+        reason="; ".join(reasons),
+        title=f"ssh · {host}",
+        detail=command,
+        allow_label=f"allow — run on {host}",
+        warning=cmd_gate.warning,
+        exception_keys=keys,
     )
 
+
 # =============================================================================
-# GATE ENFORCEMENT
+# APPROVAL MENU (1-7)
 # =============================================================================
 
-def enforce_gate(decision: GateDecision, context: str = "") -> Tuple[bool, Optional[str]]:
-    """
-    Enforce a gate decision, prompting user if needed.
-    Returns (allowed, redirect_path_or_none)
-    """
-    
+_MENU_HELP = """\
+  1  allow                     run it
+  2  allow + note              run it, and tell OGneey something (e.g. "back it up first")
+  3  deny                      don't run it
+  4  deny + reason             don't run it, and tell OGneey why
+  5  say something             don't run it yet — send a message; OGneey decides again
+  6  allow once                allow this kind of action until the current task ends
+  7  allow this session        allow this kind of action until you /quit
+  v  view                      show the full command / content
+  You can put text right after the number:  "4 use the backup dir instead"
+  Anything that isn't a choice is sent as [5] say something (never as an allow).
+  Slash commands work here: /p pauses at the boundary, /pf stops now,
+  /tier N (or /disable, /tools-off, ...) changes settings and re-checks this call."""
+
+_PREVIEW_LINES = 40
+_ALIASES = {
+    "y": "1", "yes": "1", "a": "1", "allow": "1", "ok": "1",
+    "n": "3", "no": "3", "d": "3", "deny": "3",
+    "o": "6", "once": "6",
+    "s": "7", "session": "7",
+    "v": "v", "view": "v",
+    "?": "?", "h": "?", "help": "?",
+}
+
+
+def _parse_choice(text: str) -> Tuple[Optional[str], str]:
+    s = (text or "").strip()
+    if not s:
+        return None, ""
+    m = re.match(r"^([1-7])(?:[\s.:,)\-]+(.*))?$", s, re.S)
+    if m:
+        return m.group(1), (m.group(2) or "").strip()
+    low = s.lower()
+    if low in _ALIASES:
+        return _ALIASES[low], ""
+    m = re.match(r"^(no|n|deny)[\s,:;.\-]+(.+)$", s, re.I | re.S)
+    if m:
+        return "4", m.group(2).strip()
+    m = re.match(r"^(yes|y|ok|allow)[\s,:;.\-]+(.+)$", s, re.I | re.S)
+    if m:
+        return "2", m.group(2).strip()
+    return "say", s
+
+
+def _term_width() -> int:
+    try:
+        return max(40, min(100, shutil.get_terminal_size().columns - 2))
+    except Exception:
+        return 78
+
+
+def _render_menu(decision: GateDecision, state: Session, full: bool = False):
+    width = _term_width()
+    title = decision.title or "action"
+    head = f"┌─ APPROVAL · {title} "
+    print()
+    print_warning(head + "─" * max(4, width - len(head)))
+    if decision.reason:
+        print_warning(f"│ why: {decision.reason}")
+    if decision.warning:
+        print_warning(f"│ ⚠  {decision.warning}")
+    lines = (decision.detail or "").splitlines() or [""]
+    shown = lines if full else lines[:_PREVIEW_LINES]
+    print_warning("│")
+    for ln in shown:
+        print(f"{COLORS.WARNING}│{COLORS.RESET}   {COLORS.BRIGHT_WHITE}{ln}{COLORS.RESET}")
+    if len(shown) < len(lines):
+        print_warning(f"│   … {len(lines) - len(shown)} more lines — [v] shows everything")
+    print_warning("│")
+    label = " + ".join(lbl for _, lbl in decision.exception_keys)
+    print_warning(f"│ [1] {decision.allow_label}   [2] allow + note   [3] deny")
+    print_warning("│ [4] deny + reason   [5] say something instead")
+    if label:
+        print_warning(f"│ [6] allow {label} until this task ends")
+        print_warning(f"│ [7] allow {label} for this session")
+    print_warning("│ [v] view full · [?] help · /p pause · /pf stop now · /tier N re-checks")
+    print_warning("└" + "─" * (width - 1))
+
+
+def _followup(label: str) -> Tuple[Optional[str], bool]:
+    """Ask for the note/reason/message text. Returns (text, aborted)."""
+    ans = get_hub().ask(f"{COLORS.COMMAND}  {label} › {COLORS.RESET}", kind="followup")
+    if ans.kind in ("abort", "eof"):
+        return None, True
+    if ans.kind == "command":
+        return None, ans.command in ("pause-force", "quit", "pause")
+    return ans.text.strip(), False
+
+
+def _exceptions_cover(state: Session, keys: List[Tuple[str, str]]) -> bool:
+    if not keys:
+        return False
+    ex = getattr(state, "gate_exceptions", None) or {}
+    active = set(ex.get("task", set())) | set(ex.get("session", set()))
+    return all(k in active for k, _ in keys)
+
+
+def add_gate_exceptions(state: Session, keys: List[Tuple[str, str]], scope: str):
+    ex = state.gate_exceptions.setdefault(scope, set())
+    for k, label in keys:
+        ex.add(k)
+        state.gate_exception_labels[k] = label
+
+
+def _ask_operator(decision: GateDecision, state: Session) -> GateVerdict:
+    hub = get_hub()
+    _render_menu(decision, state)
+    while True:
+        ans = hub.ask(f"{COLORS.COMMAND}  approve [1-7] › {COLORS.RESET}", kind="gate")
+        if ans.kind == "abort":
+            print_warning("  ⏹ approval cancelled (force pause)")
+            return GateVerdict(False, aborted=True, by_operator=True)
+        if ans.kind == "eof":
+            return GateVerdict(False, by_operator=True, reason="no answer (input closed)")
+        if ans.kind == "command":
+            if ans.command == "pause":
+                return GateVerdict(False, paused=True, by_operator=True)
+            if ans.command in ("pause-force", "quit"):
+                return GateVerdict(False, aborted=True, by_operator=True)
+            if not ans.command:
+                print_dim("  (unknown command — still waiting on this approval)")
+                continue
+            return GateVerdict(False, regate=True)
+
+        choice, text = _parse_choice(ans.text)
+        if choice is None:
+            print_dim("  type 1-7 (or ? for help)")
+            continue
+        if choice == "?":
+            print_system(_MENU_HELP)
+            continue
+        if choice == "v":
+            _render_menu(decision, state, full=True)
+            continue
+        if choice == "1":
+            return GateVerdict(True, by_operator=True, note=text)
+        if choice == "2":
+            if not text:
+                text, aborted = _followup("note for OGneey")
+                if aborted:
+                    return GateVerdict(False, aborted=True, by_operator=True)
+            return GateVerdict(True, by_operator=True, note=text or "")
+        if choice == "3":
+            return GateVerdict(False, by_operator=True, reason=text)
+        if choice == "4":
+            if not text:
+                text, aborted = _followup("reason")
+                if aborted:
+                    return GateVerdict(False, aborted=True, by_operator=True)
+            return GateVerdict(False, by_operator=True, reason=text or "")
+        if choice == "5":
+            if not text:
+                text, aborted = _followup("message for OGneey")
+                if aborted:
+                    return GateVerdict(False, aborted=True, by_operator=True)
+                if not text:
+                    continue
+            return GateVerdict(False, by_operator=True, message=text)
+        if choice in ("6", "7"):
+            if not decision.exception_keys:
+                print_warning("  6/7 aren't available for this kind of action — pick 1-5")
+                continue
+            scope = "task" if choice == "6" else "session"
+            add_gate_exceptions(state, decision.exception_keys, scope)
+            label = " + ".join(lbl for _, lbl in decision.exception_keys)
+            until = "this task ends" if scope == "task" else "you /quit"
+            print_success(f"  ✓ won't ask again for {label} until {until}  (/exceptions to review)")
+            return GateVerdict(True, by_operator=True, note=text)
+        if choice == "say":
+            print_dim("  ↪ sent as [5] say something (the call was NOT run)")
+            return GateVerdict(False, by_operator=True, message=text)
+
+
+def enforce_decision(decision: GateDecision, state: Session) -> GateVerdict:
+    """Apply a gate decision, asking the operator when needed."""
     if decision.result == GateResult.ALLOW:
-        return True, None
-    
-    elif decision.result == GateResult.DENY:
+        return GateVerdict(True)
+    if decision.result == GateResult.DENY:
         print_error(f"  🚫 DENIED: {decision.reason}")
-        return False, None
-    
-    elif decision.result == GateResult.REDIRECT:
+        return GateVerdict(False, reason=decision.reason)
+    if decision.result == GateResult.REDIRECT:
         print_warning(f"  ↪ Redirected: {decision.reason}")
-        if decision.redirect_path:
-            print_system(f"    → {decision.redirect_path}")
-        return True, decision.redirect_path
-    
-    elif decision.result == GateResult.PROMPT:
-        # Ask user
-        if decision.prompt_options:
-            choice = prompt_choice(
-                f"GATE: {decision.reason}",
-                decision.prompt_options
-            )
-            
-            if choice == "1":
-                return True, decision.redirect_path
-            elif choice == "2":
-                return False, None
-            elif choice == "3":
-                # User wants more info - return special signal
-                return False, "EXPLAIN"
-            else:
-                return False, None
-        else:
-            response = prompt_approval(
-                context or "Action",
-                decision.reason
-            )
-            return response == "y", None
-    
-    elif decision.result == GateResult.MODIFY:
-        print_warning(f"  ✏️ Modified: {decision.reason}")
-        if decision.modified_command:
-            print_system(f"    → {decision.modified_command}")
-        return True, decision.modified_command
-    
-    else:
-        # FIX 7: Explicit else clause catches any unhandled GateResult values
-        # (e.g., a new enum member added elsewhere but not handled here).
-        # Previously this silently fell through with `return False, None`,
-        # masking logic errors and making debugging nearly impossible.
-        # Now it logs an error and denies, failing safe.
-        print_error(f"  🚫 DENIED: Unhandled gate result {decision.result}. "
-                    f"This is a bug - report it. Reason: {decision.reason}")
-        return False, None
+        return GateVerdict(True, redirect=decision.redirect_path)
+    if decision.result == GateResult.MODIFY:
+        return GateVerdict(True)
+    if decision.result == GateResult.PROMPT:
+        if _exceptions_cover(state, decision.exception_keys):
+            label = " + ".join(lbl for _, lbl in decision.exception_keys)
+            print_dim(f"  ✓ auto-approved ({label} — exception active)")
+            return GateVerdict(True, redirect=decision.redirect_path, auto=label)
+        verdict = _ask_operator(decision, state)
+        if verdict.allowed:
+            verdict.redirect = decision.redirect_path
+        return verdict
+    print_error(f"  🚫 DENIED: unhandled gate result {decision.result} (bug). {decision.reason}")
+    return GateVerdict(False, reason="internal gate error")
+
+
+def enforce_gate(decision: GateDecision, context: str = "", state: Session = None) -> Tuple[bool, Optional[str]]:
+    """Legacy tuple interface: (allowed, redirect_path)."""
+    if state is None:
+        # Old call sites had no state; exceptions just don't apply there.
+        state = _NullState()
+    v = enforce_decision(decision, state)
+    return v.allowed, v.redirect
+
+
+class _NullState:
+    trust_tier = "probation"
+    gate_exceptions = {"task": set(), "session": set()}
+    gate_exception_labels: Dict[str, str] = {}
+
 
 # =============================================================================
-# CONVENIENCE WRAPPERS
+# CONVENIENCE WRAPPERS (legacy signatures)
 # =============================================================================
 
 def check_and_enforce_shell(command: str, state: Session) -> Tuple[bool, Optional[str]]:
-    """Check and enforce shell command gate. Returns (allowed, modified_command)."""
-    decision = gate_shell_command(command, state)
-    return enforce_gate(decision, f"Shell: {command[:60]}...")
+    v = enforce_decision(gate_shell_command(command, state), state)
+    return v.allowed, None
+
 
 def check_and_enforce_read(path: str, state: Session) -> Tuple[bool, None]:
-    """Check and enforce file read gate."""
-    decision = gate_file_read(path, state)
-    allowed, _ = enforce_gate(decision, f"Read: {path}")
-    return allowed, None
+    v = enforce_decision(gate_file_read(path, state), state)
+    return v.allowed, None
+
 
 def check_and_enforce_write(path: str, state: Session) -> Tuple[bool, Optional[str]]:
-    """Check and enforce file write gate. Returns (allowed, redirect_path)."""
-    decision = gate_file_write(path, state)
-    return enforce_gate(decision, f"Write: {path}")
+    v = enforce_decision(gate_file_write(path, state), state)
+    return v.allowed, v.redirect
+
 
 def check_and_enforce_ssh(host: str, command: str, state: Session) -> Tuple[bool, None]:
-    """Check and enforce SSH gate."""
-    decision = gate_ssh_command(host, command, state)
-    allowed, _ = enforce_gate(decision, f"SSH {host}: {command[:40]}...")
-    return allowed, None
+    """Used by the /ssh slash command. Re-checks after a slash command at the prompt."""
+    for _ in range(6):
+        v = enforce_decision(gate_ssh_command(host, command, state), state)
+        if not v.regate:
+            return v.allowed, None
+    return False, None
+
 
 # =============================================================================
 # TOOL CALL GATE (HIGH LEVEL)
 # =============================================================================
 
-# Capability classes — gate by what a tool DOES, not one exact name string.
-# Unknown write-capable tools fall through to the tier approval check.
 _FILE_READ_TOOLS = frozenset({
     "read_file", "read_text_file", "get_file", "view",
     "read_multiple_files", "search_files", "directory_tree",
@@ -757,101 +851,149 @@ def _extract_paths(args: Dict[str, Any]) -> List[str]:
     return paths
 
 
-def gate_tool_call(
-    server: str,
-    tool: str,
-    args: Dict[str, Any],
-    state: Session
-) -> Tuple[bool, Optional[Dict[str, Any]]]:
+def _content_preview(tool: str, args: Dict[str, Any]) -> str:
+    if "content" in args and isinstance(args["content"], str):
+        return args["content"]
+    if "edits" in args and isinstance(args["edits"], list):
+        out = []
+        for i, e in enumerate(args["edits"], 1):
+            if not isinstance(e, dict):
+                continue
+            old = str(e.get("oldText", e.get("old_text", "")))
+            new = str(e.get("newText", e.get("new_text", "")))
+            out.append(f"--- edit {i}: replace")
+            out.extend("  - " + ln for ln in old.splitlines() or [""])
+            out.append("    with")
+            out.extend("  + " + ln for ln in new.splitlines() or [""])
+        return "\n".join(out)
+    return ""
+
+
+def _emit(state: Session, server: str, tool: str, verdict: GateVerdict):
+    hook = getattr(state, "gate_event_hook", None)
+    if not hook:
+        return
+    try:
+        hook({
+            "tool": f"{server}/{tool}", "allowed": verdict.allowed,
+            "by_operator": verdict.by_operator, "auto": verdict.auto,
+            "note": verdict.note, "reason": verdict.reason, "message": verdict.message,
+            "aborted": verdict.aborted, "paused": verdict.paused,
+            "tier": state.trust_tier,
+        })
+    except Exception:
+        pass
+
+
+def gate_tool_call(server: str, tool: str, args: Dict[str, Any], state: Session) -> GateVerdict:
+    """Main gate for any tool call.
+
+    Returns a GateVerdict (allowed? final args? operator's words?). If the
+    operator runs a slash command at the approval prompt (/tier 3, /disable,
+    /tools-off, ...) the call is re-checked under the new settings.
     """
-    Main gate for any tool call.
-    Returns (allowed, modified_args_or_none)
-    """
+    original = copy.deepcopy(args)
+    for _ in range(6):
+        verdict = _gate_tool_call_once(server, tool, copy.deepcopy(original), state)
+        if verdict.regate:
+            print_dim(f"  ↻ re-checking {server}/{tool} with the new settings…")
+            continue
+        _emit(state, server, tool, verdict)
+        return verdict
+    return GateVerdict(False, reason="approval re-check limit reached")
+
+
+def _merge(a: GateVerdict, b: GateVerdict) -> GateVerdict:
+    if b.note:
+        a.note = (a.note + "\n" + b.note).strip()
+    a.by_operator = a.by_operator or b.by_operator
+    a.auto = a.auto or b.auto
+    return a
+
+
+def _gate_tool_call_once(server: str, tool: str, args: Dict[str, Any], state: Session) -> GateVerdict:
     tier = get_tier_config(state)
     tool_key = f"{server}/{tool}"
-    
-    # Check if tool is disabled
-    if hasattr(state, 'disabled_tools'):
-        if server in state.disabled_tools or tool_key in state.disabled_tools:
-            print_warning(f"  🚫 Tool disabled: {tool_key}")
-            return False, None
-    
-    # Check if tools are globally off
+
+    disabled = getattr(state, "disabled_tools", set()) or set()
+    if server in disabled or tool_key in disabled:
+        print_warning(f"  🚫 Tool disabled: {tool_key}")
+        return GateVerdict(False, reason=f"{tool_key} is disabled by the operator (/enable to restore)")
+
     if not state.tools_enabled:
-        print_warning(f"  🔒 Tools disabled. Use /tools-on to enable.")
-        return False, None
-    
-    # Shell commands get special handling
+        print_warning("  🔒 Tools disabled. Use /tools-on to enable.")
+        return GateVerdict(False, reason="tools are switched off by the operator (chat-only mode)")
+
+    # Shell commands: the policy file decides.
     if tool in _SHELL_TOOLS:
         command = args.get("command", "")
-        allowed, modified = check_and_enforce_shell(command, state)
-        if modified and modified != "EXPLAIN":
-            args["command"] = modified
-        return allowed, args if allowed else None
+        decision = gate_shell_command(command, state)
+        decision.title = tool_key
+        v = enforce_decision(decision, state)
+        v.args = args if v.allowed else None
+        return v
 
-    # File read tools (single path, path lists, directory listings)
+    # File reads
     if tool in _FILE_READ_TOOLS:
         for path in _extract_paths(args):
-            allowed, _ = check_and_enforce_read(path, state)
-            if not allowed:
-                return False, None
-        return True, args
+            v = enforce_decision(gate_file_read(path, state), state)
+            if not v.allowed:
+                return v
+        return GateVerdict(True, args=args)
 
-    # File write tools (writes, edits, directory creation)
+    # File writes (writes, edits, directory creation)
     if tool in _FILE_WRITE_TOOLS:
+        result = GateVerdict(True, args=args)
+        preview = _content_preview(tool, args)
         for path in _extract_paths(args):
-            allowed, redirect = check_and_enforce_write(path, state)
-            if not allowed:
-                return False, None
-            if redirect and redirect != "EXPLAIN":
-                # Apply the shadow redirect to whichever arg held this path
+            decision = gate_file_write(path, state, preview)
+            decision.title = f"{tool_key}"
+            v = enforce_decision(decision, state)
+            if not v.allowed:
+                return v
+            _merge(result, v)
+            if v.redirect and v.redirect != "EXPLAIN":
                 for key in _PATH_ARG_KEYS:
                     if args.get(key) == path:
-                        args[key] = redirect
-                Path(redirect).parent.mkdir(parents=True, exist_ok=True)
-        return True, args
+                        args[key] = v.redirect
+                Path(v.redirect).parent.mkdir(parents=True, exist_ok=True)
+        result.args = args
+        return result
 
-    # Move/rename: source must be readable, destination must pass write gate
+    # Move/rename: never redirected into shadow (that relocated real files).
     if tool in _FILE_MOVE_TOOLS:
         src = args.get("source", "") or args.get("path", "")
         dst = args.get("destination", "") or args.get("new_path", "")
-        if src:
-            allowed, _ = check_and_enforce_read(src, state)
-            if not allowed:
-                return False, None
-        if dst:
-            allowed, redirect = check_and_enforce_write(dst, state)
-            if not allowed:
-                return False, None
-            if redirect and redirect != "EXPLAIN":
-                for key in ("destination", "new_path"):
-                    if args.get(key) == dst:
-                        args[key] = redirect
-                Path(redirect).parent.mkdir(parents=True, exist_ok=True)
-        return True, args
+        decision = gate_file_move(src, dst, state)
+        decision.title = tool_key
+        v = enforce_decision(decision, state)
+        v.args = args if v.allowed else None
+        v.redirect = None
+        return v
 
     # Network egress (web tools, browser, local/speak TTS, ...)
     if tool in _NETWORK_TOOLS:
         url = (args.get("url") or args.get("uri") or args.get("endpoint")
-               or tool_key)
-        decision = gate_network_request(url, state)
-        allowed, _ = enforce_gate(decision, f"Network: {tool_key}")
-        return allowed, args if allowed else None
-    
-    # If tier requires approval for all tools
+               or args.get("query") or tool_key)
+        v = enforce_decision(gate_network_request(str(url), state, tool_key=tool_key), state)
+        v.args = args if v.allowed else None
+        return v
+
+    # Tier 0: every tool needs approval
     if tier.requires_tool_approval:
-        response = prompt_approval(
-            f"Tool call: {tool_key}",
-            f"Args: {str(args)[:100]}...",
-            ["y", "n", "details"]
+        try:
+            detail = json.dumps(args, indent=2, default=str)
+        except (TypeError, ValueError):
+            detail = str(args)
+        decision = GateDecision(
+            result=GateResult.PROMPT,
+            reason=f"{state.trust_tier} tier: every tool call needs approval",
+            title=tool_key,
+            detail=detail,
+            exception_keys=[(f"tool:{tool_key}", f"`{tool_key}`")],
         )
-        if response == "y":
-            return True, args
-        elif response == "details":
-            print_system(f"Full args: {args}")
-            return False, None
-        else:
-            return False, None
-    
-    # Default: allow
-    return True, args
+        v = enforce_decision(decision, state)
+        v.args = args if v.allowed else None
+        return v
+
+    return GateVerdict(True, args=args)
